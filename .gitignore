@@ -1,0 +1,56 @@
+# Secrets
+.env
+.arena-credentials
+.arena-poker-state
+.arena-poker-state.tmp
+
+# v0.15 onboarding milestone state (per-project, local)
+.pokerkit-milestones.json
+.pokerkit-milestones.json.tmp
+
+# Replay viewer output (regenerate with `pokerkit replay`)
+replay.html
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# venv / uv
+.venv/
+venv/
+.uv/
+uv.lock
+
+# Tests — keep test_smoke.py + test_llm_parser.py committed; ignore cache artifacts only
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude / OMC session artifacts
+.omc/
+.claude/
+.aider*
+
+# ── System 7 runtime artifacts (regenerated locally) ──
+*.db
+*.db-shm
+*.db-wal
+*.bak.*.db
+*.log
+report.md
+first_table.json
+strategies/coach-*.json

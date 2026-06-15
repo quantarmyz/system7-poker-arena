@@ -1,0 +1,32 @@
+[project]
+name = "arena-pokerkit"
+version = "0.18.1"
+description = "Build a poker agent for dev.fun Arena"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "httpx>=0.27",
+    "python-dotenv>=1.0",
+    "treys>=0.1.8",
+    "pokerkit>=0.5",
+]
+
+[project.optional-dependencies]
+# `llm` extras for L2 LLM-in-the-loop agent. Model-agnostic: install
+# either provider (or both); the agent picks the first one whose API key
+# is set in the environment. OpenAI client also covers OpenAI-compatible
+# endpoints (OpenRouter, Together, Groq, vLLM) via OPENAI_BASE_URL.
+llm = ["anthropic>=0.40", "openai>=1.0"]
+dev = ["pytest>=8", "respx>=0.21"]
+
+# `pokerkit` branded CLI verb. Once you `uv pip install -e .` (or
+# `pip install arena-pokerkit`), the entry-point dispatches to
+# examples/cli.py. For pure-uv-run-without-install workflows the
+# repo also ships a `pokerkit` shell wrapper at the repo root that
+# does the same thing via `python -m examples.cli`.
+[project.scripts]
+pokerkit = "examples.cli:main"
+
+[tool.uv]
+package = false

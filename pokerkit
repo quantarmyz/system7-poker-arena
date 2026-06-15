@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# pokerkit — branded CLI wrapper. Dispatches to examples/cli.py.
+# After `uv pip install -e .` (or `pip install arena-pokerkit`) the
+# [project.scripts] entry-point in pyproject.toml replaces this with
+# an installed binary on PATH. For the uv-run-without-install flow,
+# this script is what gets called.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Prefer the uv-managed interpreter if available; fall back to python3.
+if command -v uv >/dev/null 2>&1 && [ -f "$HERE/pyproject.toml" ]; then
+  exec uv run --project "$HERE" python "$HERE/examples/cli.py" "$@"
+fi
+exec python3 "$HERE/examples/cli.py" "$@"

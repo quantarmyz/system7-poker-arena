@@ -1,0 +1,88 @@
+# My Poker Strategy
+
+> Fill this in, then run:
+>
+>     pokerkit analyze --out failure_report.txt
+>
+> Then paste both files into Claude Code / Codex with the Heuristic Learning
+> prompt from examples/prompt.md:
+>
+>     "Read STRATEGY.md and failure_report.txt, then improve decide() in
+>      examples/agent.py. Zero LLM calls at runtime. Bake everything into code."
+
+---
+
+## Starting Hand Ranges
+
+**UTG (tightest):**
+<!-- example: raise AA-TT, AKs, AQs, KQs. Fold everything else. -->
+
+**MP:**
+<!-- example: raise AA-77, AKs-AJs, AKo-AQo, KQs. -->
+
+**CO:**
+<!-- example: raise AA-55, AXs, AKo-ATo, KQs-KTs, suited connectors 76s+. -->
+
+**BTN (widest):**
+<!-- example: open 40-50% of hands. All pairs, AX, KXs, suited connectors. -->
+
+**SB:**
+<!-- example: raise-or-fold, no limping. Tight range. -->
+
+**BB:**
+<!-- example: defend wide against late-position opens. Re-raise strong hands only. -->
+
+---
+
+## Postflop Philosophy
+
+**When I have top pair or better:**
+<!-- example: bet for value 60-75% pot on most textures. -->
+
+**Dry boards (e.g. K72 rainbow):**
+<!-- example: bet wide with range advantage, small sizing 33-40%. -->
+
+**Wet boards (e.g. JT9 two-tone):**
+<!-- example: check more, protect range. Bet strong made hands and draws only. -->
+
+**In position (IP) vs out of position (OOP):**
+<!-- IP: bet more often, control pot size.
+     OOP: check-call strong hands, check-fold weak ones. -->
+
+---
+
+## Aggression Style
+
+- Bluff frequency: low / medium / high
+- 3-bet range: value-only / balanced (bluffs + value) / aggressive
+- C-bet frequency: always / selective (board-texture driven) / rarely
+
+---
+
+## Bet Sizing Rules
+
+| Situation            | Sizing       |
+|----------------------|--------------|
+| Preflop open         | 2.5× BB      |
+| Preflop 3-bet        | 3× the open  |
+| Dry flop c-bet       | 33% pot      |
+| Wet flop c-bet       | 66% pot      |
+| River value bet      | 66-75% pot   |
+| River bluff          | 75% pot      |
+
+---
+
+## Adaptation to Opponents
+
+<!-- example: If villain folds to c-bets > 60%, bet every flop regardless of cards.
+     If villain calls too wide, value-bet thinly, bluff less.
+     If villain is very tight (VPIP < 20%), fold more to their aggression. -->
+
+---
+
+## What I Want to Fix
+
+<!-- What are the known weaknesses of the current decide() heuristic?
+     Look at `pokerkit analyze` output for data-driven answers.
+     example: "UTG folds profitable hands like 99/TT. BB defends too loose.
+     River sizing too small (50% pot vs optimal 66-75%)." -->
