@@ -1,0 +1,44 @@
+# System 7 — dev.fun Arena poker bot. Deploy: `docker compose up -d` (dashboard only).
+# Optional continuous workers: `docker compose --profile bench up -d`  (or `--profile pvp`).
+# Put your keys in .env first (see .env.example). Data persists in ./data.
+
+x-common: &common
+  build: .
+  image: system7-poker-arena:latest
+  env_file: [.env]
+  volumes: ["./data:/data"]
+  restart: unless-stopped
+  init: true                      # tini as PID 1 → reaps orphaned run subprocesses
+  environment: &common-env
+    S7_STATS_DB: /data/s7_test.db
+    S7_STRAT_DIR: /data/strategies
+    S7_CLASIF_DIR: /data/.clasif
+    S7_JOBS_DIR: /data/jobs
+
+services:
+  # Always-on: web dashboard. Launches/stops/reads runs itself (subprocess backend),
+  # so RUN / COACH / batch / multiLLM all work from the UI inside the container.
+  dashboard:
+    <<: *common
+    command: ["dashboard"]
+    ports: ["8787:8787"]
+    environment:
+      <<: *common-env
+      S7_RUN_BACKEND: subprocess
+
+  # Optional: continuous Eval test-bench worker (clasificatorias vs the near-GTO panel).
+  bench:
+    <<: *common
+    command: ["bench"]
+    profiles: ["bench"]
+    environment:
+      <<: *common-env
+      S7_RUN_LABEL: bench
+      S7_ENGINE: hybrid
+      S7_MATCHES: "50"
+
+  # Optional: PvP Playground loop (play-money; needs the Playground open).
+  pvp:
+    <<: *common
+    command: ["pvp"]
+    profiles: ["pvp"]

@@ -159,18 +159,57 @@ uv run s7_dash.py                                  # http://localhost:8787
 
 ---
 
+## 🐳 Deploy with Docker
+
+The whole thing ships as a container — no systemd, no host setup. The dashboard launches/stops/reads
+training runs itself (a built-in subprocess backend auto-replaces systemd), so **the full UI works inside
+the container**: the RUN tab, the COACH strategy generator, the clasificatoria batches and the multiLLM
+benchmark all run as tracked subprocesses.
+
+```bash
+# 1. clone + configure
+git clone https://github.com/quantarmyz/system7-poker-arena.git
+cd system7-poker-arena
+cp .env.example .env          # fill ARENA_API_KEY, OPENAI_API_KEY + OPENAI_BASE_URL (MiniMax M3), …
+
+# 2. up
+docker compose up -d          # builds the image + starts the dashboard
+
+# 3. open the dashboard
+#    http://localhost:8787   → PANEL / MANOS / PLAYERS / COACH / RUN / RANK / multiLLM
+```
+
+Launch matches from the **RUN** tab (or COACH → "generar/lanzar versión"); they appear live in RANK and the
+equity curve. Everything persists in **`./data`** (SQLite DBs, `strategies/`, `.clasif/` claim creds, job
+logs) — survives `docker compose down && up -d`. Secrets stay in `.env` / `./data`, never in the image or repo.
+
+**Optional always-on workers** (off by default):
+
+```bash
+docker compose --profile bench up -d   # continuous Eval test-bench vs the near-GTO panel
+docker compose --profile pvp   up -d   # PvP Playground loop (run_pvp.py)
+```
+
+> The same code runs under **systemd** on a bare host (the backend auto-detects `systemd-run`/`journalctl`);
+> set `S7_RUN_BACKEND=systemd|subprocess` to force it.
+
+---
+
 ## Project layout
 
 ```
 decide_system7.py      heuristic engine (deterministic, offline)
 hybrid_system7.py      heuristic ↔ M3 routing
 llm_system7.py         MiniMax M3 (OpenAI-compatible) integration
-s7_strat.py            versioned strategy loader      strategies/*.json
+s7_strat.py            versioned strategy loader      strategies/*.json (incl. s7-opus)
 s7_reads.py            opponent HUD / reads
 s7_stats.py            SQLite recorder                s7_test.py  eval bench
 s7_report.py           report for the coach           s7_dash.py  dashboard + replayer
+s7_mllm.py             multiLLM benchmark runner      s7_batch.py  wave runner (clasificatorias)
+s7_jobs.py             run backend (systemd | subprocess, auto-detected)
 run_system7.py · run_hybrid_system7.py · run_pvp.py   live runners
 system7_prompt.md      M3 decision/coach prompt
+Dockerfile · docker-compose.yml · docker/entrypoint.sh   container deploy
 tests/                 test_system7.py (engine regression) + kit tests
 docs/                  ARCHITECTURE · COACH-LOOP · DASHBOARD
 examples/              starter-kit client/loop (ArenaClient, agent, llm_agent, …)

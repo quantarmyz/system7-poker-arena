@@ -65,6 +65,15 @@ def init():
             agent_id TEXT PRIMARY KEY, ts REAL, name TEXT, n INTEGER, vpip REAL, pfr REAL,
             af REAL, bluff_pct REAL, wtsd REAL, wsd REAL, style TEXT)""")
         c.execute("CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)")
+        c.execute("""CREATE TABLE IF NOT EXISTS mllm_runs(
+            run_id TEXT PRIMARY KEY, ts REAL, status TEXT, models TEXT, judge TEXT,
+            n_hands INTEGER, n_reps INTEGER, note TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS mllm_results(
+            run_id TEXT, model TEXT, provider TEXT, hand_key TEXT, dec_ts REAL, rep INTEGER,
+            action TEXT, amount INTEGER, valid INTEGER, latency_ms INTEGER,
+            prompt_tokens INTEGER, completion_tokens INTEGER, answer TEXT, reasoning TEXT,
+            think TEXT, judge_score REAL, judge_note TEXT, m3_action TEXT, ts REAL)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_mllm_res_run ON mllm_results(run_id)")
 
 
 def log_decision(d: dict):
@@ -148,3 +157,28 @@ def log_agent_stats(agent_id, name, st):
 def set_meta(k, v):
     with _conn() as c:
         c.execute("INSERT OR REPLACE INTO meta VALUES(?,?)", (k, json.dumps(v, default=str)))
+
+
+# ── multiLLM benchmark ──────────────────────────────────────────────────────────
+def mllm_start(run_id, models, judge, n_hands, n_reps, note=""):
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO mllm_runs VALUES(?,?,?,?,?,?,?,?)",
+                  (run_id, time.time(), "running", json.dumps(models, default=str),
+                   judge or "", n_hands, n_reps, note))
+
+
+def mllm_finish(run_id, status="done"):
+    with _conn() as c:
+        c.execute("UPDATE mllm_runs SET status=? WHERE run_id=?", (status, run_id))
+
+
+_MLLM_COLS = ["run_id", "model", "provider", "hand_key", "dec_ts", "rep", "action", "amount",
+              "valid", "latency_ms", "prompt_tokens", "completion_tokens", "answer", "reasoning",
+              "think", "judge_score", "judge_note", "m3_action"]
+
+
+def log_mllm_result(d: dict):
+    with _conn() as c:
+        c.execute("INSERT INTO mllm_results(" + ",".join(_MLLM_COLS) + ",ts) VALUES(" +
+                  ",".join("?" * len(_MLLM_COLS)) + ",?)",
+                  tuple(d.get(k) for k in _MLLM_COLS) + (time.time(),))

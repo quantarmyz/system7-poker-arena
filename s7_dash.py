@@ -38,11 +38,29 @@ def _load_env():
 
 
 _load_env()
-_coach_cache = {"ts": 0.0, "txt": None, "hands": 0}
+_coach_cache = {"ts": 0.0, "txt": None, "hands": 0, "proposal": None, "version": None,
+                "running": False, "err": None, "window": None}
+# Strategy generator (pro-player persona) — async, mirrors the coach cache. data = full editable proposal.
+_stratgen_cache = {"ts": 0.0, "data": None, "running": False, "err": None, "window": None, "mode": None}
+# Shared strategy defaults/limits (mirror decide_system7) used by the builder + validation.
+KN_DEFAULTS = {"open_size_bb": 2.5, "threebet_mult": 3, "value_eq": 0.62, "station_mult": 1.2,
+               "cbet_bluff_frac": 0.33, "commit_spr": 3, "perejil_flop": 8, "perejil_turn": 10, "perejil_relief": 2}
+KN_LIMITS = {"open_size_bb": (1.5, 5), "threebet_mult": (2, 5), "value_eq": (0.5, 0.85),
+             "station_mult": (1.0, 2.0), "cbet_bluff_frac": (0.0, 1.0), "commit_spr": (1, 8),
+             "perejil_flop": (4, 14), "perejil_turn": (6, 16), "perejil_relief": (0, 5)}
+_POS6 = ["UTG", "MP", "CO", "BTN", "SB", "BB"]
+_DEF_3BV = ["AA", "KK", "QQ", "JJ", "AKs", "AKo", "AQs"]
+_DEF_3BB = ["A2s", "A3s", "A4s", "A5s", "K9s", "Q9s"]
 try:
     import s7_strat
 except Exception:
     s7_strat = None
+try:
+    import s7_mllm   # loads .env (provider keys) on import → provider_ready() works in the dash
+except Exception:
+    s7_mllm = None
+import s7_jobs        # run backend: systemd on the LXC, plain subprocess in Docker (auto-detected)
+CLASIF_DIR = os.environ.get("S7_CLASIF_DIR", os.path.join(HERE, ".clasif"))
 _cache = {"ts": 0.0, "data": None}
 _lock = threading.Lock()
 
@@ -52,11 +70,7 @@ def _ro():
 
 
 def _svc(name):
-    try:
-        return subprocess.run(["systemctl", "is-active", name],
-                              capture_output=True, text=True, timeout=3).stdout.strip() or "?"
-    except Exception:
-        return "?"
+    return s7_jobs.is_active(name)
 
 
 def _state():
@@ -379,12 +393,28 @@ def _players(limit=400):
 COACH_NEED = 5000
 
 
-def _coach():
-    """Rule-based analysis of our play + opponents (gated at 10k hands)."""
+def _coach(window=None):
+    """Rule-based analysis of our play vs optimal targets (gated at 5k hands).
+
+    window: None/'all' = todas las manos; int (p.ej. 10000) = sólo las últimas N manos.
+    Añade `vs_opt` (tu stat vs banda óptima 6-max + veredicto ✓/⚠/✗) y `vs_panel`
+    (bb/100 agregado contra el panel near-GTO DeepCFR = distancia al óptimo real)."""
     try:
         c = _ro()
     except Exception as e:
         return {"error": str(e)}
+    try:
+        n = int(window) if window not in (None, "", "all") else 0
+    except Exception:
+        n = 0
+    n = max(0, min(500000, n))
+
+    def hk(col="hand_key"):
+        """AND-clause limiting to the most-recent N hands (empty if no window)."""
+        if n > 0:
+            return (" AND %s IN (SELECT hand_key FROM decisions GROUP BY hand_key "
+                    "ORDER BY MAX(ts) DESC LIMIT %d) " % (col, n))
+        return " "
 
     def q(sql, a=()):
         try:
@@ -392,35 +422,71 @@ def _coach():
         except Exception:
             return []
 
-    hands = (q("select count(distinct hand_key) from decisions") or [[0]])[0][0]
-    if hands < COACH_NEED:
+    def verdict(v, lo, hi, soft):
+        if v is None:
+            return "—"
+        if lo <= v <= hi:
+            return "✓"
+        if (lo - soft) <= v <= (hi + soft):
+            return "⚠"
+        return "✗"
+
+    total_hands = (q("select count(distinct hand_key) from decisions") or [[0]])[0][0]
+    if total_hands < COACH_NEED:
         c.close()
-        return {"locked": True, "hands": hands, "need": COACH_NEED}
-    findings, advice = [], []
-    v = q("select sum(voluntary),sum(preflop_raise),count(*) from decisions where street='preflop'")
+        return {"locked": True, "hands": total_hands, "need": COACH_NEED}
+    win_hands = (q("select count(distinct hand_key) from decisions where 1=1" + hk()) or [[0]])[0][0]
+    findings, advice, vs_opt = [], [], []
+
+    v = q("select sum(voluntary),sum(preflop_raise),count(*) from decisions where street='preflop'" + hk())
     if v and v[0][2]:
-        vol, pfr, n = v[0]
-        vp, pf = round(100 * vol / n), round(100 * pfr / n)
-        findings.append({"k": "VPIP / PFR global", "v": f"{vp}% / {pf}%", "ref": "~22 / 18"})
+        vol, pfr, npf = v[0]
+        vp, pf = round(100 * (vol or 0) / npf), round(100 * (pfr or 0) / npf)
+        gap = vp - pf
+        findings.append({"k": "VPIP / PFR", "v": f"{vp}% / {pf}%", "ref": "~22 / 18"})
+        vs_opt.append({"k": "VPIP", "you": f"{vp}%", "target": "20–26%",
+                       "verdict": verdict(vp, 20, 26, 4), "note": "manos jugadas voluntariamente"})
+        vs_opt.append({"k": "PFR", "you": f"{pf}%", "target": "16–20%",
+                       "verdict": verdict(pf, 16, 20, 4), "note": "frecuencia de subida preflop"})
+        vs_opt.append({"k": "Gap VPIP-PFR", "you": f"{gap}", "target": "≤8",
+                       "verdict": verdict(gap, 0, 8, 4), "note": "demasiado flat si es alto"})
         if vp < 16:
             advice.append(f"Muy tight (VPIP {vp}%). Abre más en BTN/CO/SB.")
         elif vp > 30:
             advice.append(f"VPIP {vp}% alto; recorta manos marginales fuera de posición.")
-        if vp - pf > 10:
-            advice.append(f"Gap VPIP-PFR {vp-pf} grande → demasiado flat preflop; 3-betea o foldea más.")
-    ff = q("select sum(case when action='fold' then 1 else 0 end),count(*) from decisions where street='flop' and call_chips>0")
-    if ff and ff[0][1]:
-        ftc = round(100 * ff[0][0] / ff[0][1])
+        if gap > 10:
+            advice.append(f"Gap VPIP-PFR {gap} grande → demasiado flat preflop; 3-betea o foldea más.")
+    cb = q("select sum(case when action in('bet','all-in') then 1 else 0 end),"
+           "sum(case when action='check' then 1 else 0 end) from decisions "
+           "where street='flop' and (call_chips is null or call_chips<=0)" + hk())
+    if cb and cb[0][0] is not None and ((cb[0][0] or 0) + (cb[0][1] or 0)) >= 100:
+        bets, checks = cb[0][0] or 0, cb[0][1] or 0
+        cbp = round(100 * bets / (bets + checks))
+        findings.append({"k": "C-bet flop", "v": f"{cbp}%", "ref": "55–72%"})
+        vs_opt.append({"k": "C-bet flop", "you": f"{cbp}%", "target": "55–72%",
+                       "verdict": verdict(cbp, 55, 72, 8), "note": "apuesta de continuación tras subir preflop"})
+        if cbp > 85:
+            advice.append(f"C-bet flop muy alto ({cbp}%); equilibra con más checks de protección de rango.")
+        elif cbp < 45:
+            advice.append(f"C-bet flop bajo ({cbp}%); aprovecha más la iniciativa como agresor preflop.")
+    # Fold-to-cbet sólo si hay muestra suficiente (este bot suele ser el agresor → rara vez afronta apuesta).
+    ff = q("select sum(case when action='fold' then 1 else 0 end),count(*) from decisions "
+           "where street='flop' and call_chips>0" + hk())
+    if ff and ff[0][1] and ff[0][1] >= 200:
+        ftc = round(100 * (ff[0][0] or 0) / ff[0][1])
         findings.append({"k": "Fold-to-bet flop", "v": f"{ftc}%", "ref": "<55%"})
+        vs_opt.append({"k": "Fold-to-cbet flop", "you": f"{ftc}%", "target": "45–55%",
+                       "verdict": verdict(ftc, 45, 55, 6), "note": "te explotan si foldeas de más"})
         if ftc > 58:
             advice.append(f"Foldeas demasiado al c-bet en flop ({ftc}%). Defiende más (flota/raise).")
-    pos = q("select pos,count(*),sum(voluntary),sum(preflop_raise) from decisions where street='preflop' and pos!='' group by pos")
+    pos = q("select pos,count(*),sum(voluntary),sum(preflop_raise) from decisions "
+            "where street='preflop' and pos!=''" + hk() + " group by pos")
     order = {"UTG": 0, "MP": 1, "CO": 2, "BTN": 3, "SB": 4, "BB": 5}
     bypos = sorted([{"pos": r[0], "n": r[1], "vpip": round(100 * r[2] / r[1]) if r[1] else 0,
                      "pfr": round(100 * r[3] / r[1]) if r[1] else 0} for r in pos], key=lambda x: order.get(x["pos"], 9))
     buckets = q("select d.pos, sum(hr.chip_delta), count(distinct d.hand_key) from decisions d "
                 "join hand_results hr on hr.table_id = substr(d.hand_key,1,instr(d.hand_key,':')-1) "
-                "where d.street='preflop' and d.pos!='' group by d.pos")
+                "where d.street='preflop' and d.pos!=''" + hk("d.hand_key") + " group by d.pos")
     posres = sorted([{"pos": r[0], "delta": r[1] or 0, "n": r[2]} for r in buckets], key=lambda x: x["delta"])
     if posres and posres[0]["delta"] < 0:
         w = posres[0]
@@ -430,11 +496,17 @@ def _coach():
                 key=lambda x: -(x["bb100"] if x["bb100"] is not None else -999))
     if len(ab) >= 2 and ab[0]["bb100"] is not None and ab[-1]["bb100"] is not None:
         advice.append(f"A/B: lidera '{ab[0]['label']}' ({ab[0]['bb100']:+} bb/100, n={ab[0]['n']}) vs '{ab[-1]['label']}' ({ab[-1]['bb100']:+}).")
+    pan = q("select count(*),avg(adjusted_bb100),sum(hands) from runs where hands>=400")
+    vs_panel = None
+    if pan and pan[0][0]:
+        vs_panel = {"bb100": round(pan[0][1], 1) if pan[0][1] is not None else None,
+                    "runs": pan[0][0], "hands": pan[0][2] or 0}
     opp = [{"name": o[0], "vpip": o[1], "pfr": o[2], "af": o[3]} for o in q("select name,vpip,pfr,af from agent_stats")]
     c.close()
     if not advice:
         advice.append("Sin leaks claros con esta muestra; sigue acumulando.")
-    return {"locked": False, "hands": hands, "findings": findings, "bypos": bypos,
+    return {"locked": False, "hands": total_hands, "win_hands": win_hands, "window": (n or "all"),
+            "vs_opt": vs_opt, "vs_panel": vs_panel, "findings": findings, "bypos": bypos,
             "posres": posres, "ab": ab, "advice": advice, "opp": opp}
 
 
@@ -445,18 +517,15 @@ def _validate_strat(cfg):
     out = {}
     orr = cfg.get("opening_ranges")
     if isinstance(orr, dict):
-        clean = {str(p).upper(): [str(t) for t in toks][:60] for p, toks in orr.items()
+        clean = {str(p).upper(): [str(t) for t in toks][:169] for p, toks in orr.items()
                  if str(p).upper() in ("UTG", "MP", "CO", "BTN", "SB", "BB") and isinstance(toks, list)}
         if clean:
             out["opening_ranges"] = clean
     for k in ("threebet_value", "threebet_bluff"):
         if isinstance(cfg.get(k), list):
-            out[k] = [str(t) for t in cfg[k]][:30]
-    lim = {"open_size_bb": (1.5, 5), "threebet_mult": (2, 5), "value_eq": (0.5, 0.85),
-           "station_mult": (1.0, 2.0), "cbet_bluff_frac": (0.0, 1.0), "commit_spr": (1, 8),
-           "perejil_flop": (4, 14), "perejil_turn": (6, 16), "perejil_relief": (0, 5)}
+            out[k] = [str(t) for t in cfg[k]][:60]
     kn = cfg.get("knobs") if isinstance(cfg.get("knobs"), dict) else {}
-    ck = {k: max(lo, min(hi, kn[k])) for k, (lo, hi) in lim.items() if isinstance(kn.get(k), (int, float))}
+    ck = {k: max(lo, min(hi, kn[k])) for k, (lo, hi) in KN_LIMITS.items() if isinstance(kn.get(k), (int, float))}
     if isinstance(kn.get("sizing"), dict):
         ck["sizing"] = kn["sizing"]
     if ck:
@@ -464,19 +533,8 @@ def _validate_strat(cfg):
     return out or None
 
 
-def _coach_llm():
-    """Narrative coaching + a proposed new strategy version via MiniMax M3 (cached, gated)."""
-    hands = 0
-    try:
-        cc = _ro()
-        hands = cc.execute("select count(distinct hand_key) from decisions").fetchone()[0]
-        cc.close()
-    except Exception:
-        pass
-    if hands < COACH_NEED:
-        return {"locked": True, "hands": hands, "need": COACH_NEED}
-    if _coach_cache["txt"] and time.time() - _coach_cache["ts"] < 600 and hands - _coach_cache["hands"] < 500:
-        return {"text": _coach_cache["txt"], "cached": True}
+def _coach_compute(hands, window=None):
+    """The slow M3 coaching call (runs in a background thread; writes _coach_cache)."""
     try:
         import sys as _sys
         _sys.path.insert(0, os.path.join(HERE, "examples"))
@@ -495,17 +553,31 @@ def _coach_llm():
             cur = dict(_D.KN)
         except Exception:
             pass
+        diag = _coach(window)
+        win_txt = ("últimas %s manos" % window) if window not in (None, "all", "") else "todas las manos"
+        leaks = "; ".join("%s: %s vs objetivo %s [%s]" % (o["k"], o["you"], o["target"], o["verdict"])
+                          for o in (diag.get("vs_opt") or []))
         system = ("Eres un coach de NLHE 6-max de élite (metodología EducaPoker / GTO node-locking). "
-                  "Te paso el informe de System 7 contra un panel near-GTO (DeepCFR) y su config actual. "
+                  "Te paso el informe de System 7 contra un panel near-GTO (DeepCFR), su config actual y un "
+                  "diagnóstico tu-juego-vs-óptimo de la ventana analizada. "
                   "(1) Análisis ACCIONABLE de leaks (preflop por posición + postflop). "
                   "(2) Propón UNA versión nueva partiendo de la actual. Termina con SOLO un bloque ```json``` con las "
                   "claves a CAMBIAR: opening_ranges {pos:[tokens '22+','A2s+','KTo+']}, threebet_value, threebet_bluff, "
                   "knobs {open_size_bb,threebet_mult,value_eq,station_mult,cbet_bluff_frac,commit_spr,perejil_flop,"
-                  "perejil_turn,perejil_relief}. Incluye solo lo que cambies. Español, conciso.\n\n" + meth[:1600])
-        user = "CONFIG ACTUAL knobs: " + json.dumps(cur) + "\n\nINFORME:\n" + rep
-        txt = llm_system7._minimax_call(system, user, 2600, os.environ.get("S7_MODEL", "MiniMax-M3"))
+                  "perejil_turn,perejil_relief}. Incluye solo lo que cambies. Español, MUY conciso, ve al grano "
+                  "sin razonar de más.\n\n" + meth[:400])
+        user = ("VENTANA: %s\nDIAGNÓSTICO vs óptimo: %s\nCONFIG ACTUAL knobs: %s\n\nINFORME:\n%s"
+                % (win_txt, leaks or "(sin datos)", json.dumps(cur), rep))
+        _cerr = None
+        if s7_mllm is not None:
+            _r = s7_mllm._chat("minimax", os.environ.get("S7_MODEL", "MiniMax-M3"), system, user, max_tokens=10000)
+            txt, _cerr = (None if _r.get("error") else (_r.get("answer") or "")), _r.get("error")
+        else:
+            txt = llm_system7._minimax_call(system, user, 6000, os.environ.get("S7_MODEL", "MiniMax-M3"))
         if not txt:
-            return {"error": "M3 no devolvió respuesta (revisa OPENAI_API_KEY / tokens)."}
+            _coach_cache.update(running=False, ts=time.time(),
+                                err=("M3: " + _cerr) if _cerr else "M3 no devolvió respuesta (tokens/clave).")
+            return
         prose, proposal, version = txt, None, None
         m = re.search(r"```json\s*(\{.*\})\s*```", txt, re.S) or re.search(r"(\{.*\})\s*$", txt, re.S)
         if m:
@@ -517,30 +589,247 @@ def _coach_llm():
                     proposal, prose = cfg, txt[:m.start()].strip()
             except Exception:
                 pass
-        _coach_cache.update(ts=time.time(), txt=prose, hands=hands)
-        return {"text": prose, "proposal": proposal, "version": version, "cached": False}
+        _coach_cache.update(ts=time.time(), txt=prose, hands=hands, proposal=proposal, version=version,
+                            err=None, running=False, window=window)
+    except Exception as e:
+        _coach_cache.update(running=False, err=str(e), ts=time.time())
+
+
+def _coach_llm(window=None):
+    """Non-blocking: returns the cached analysis, or kicks off a background M3 run and reports progress.
+    A change of `window` invalidates the cache so the narrative re-runs for the new sample."""
+    hands = 0
+    try:
+        cc = _ro()
+        hands = cc.execute("select count(distinct hand_key) from decisions").fetchone()[0]
+        cc.close()
+    except Exception:
+        pass
+    if hands < COACH_NEED:
+        return {"locked": True, "hands": hands, "need": COACH_NEED}
+    c = _coach_cache
+    if c.get("running"):
+        return {"running": True, "hands": hands}
+    if c.get("txt") and c.get("window") == window and time.time() - c["ts"] < 900:
+        return {"text": c["txt"], "proposal": c.get("proposal"), "version": c.get("version"), "cached": True}
+    if c.get("err") and c.get("window") == window and time.time() - c["ts"] < 30:
+        return {"error": c["err"]}
+    c["running"] = True
+    c["window"] = window
+    threading.Thread(target=_coach_compute, args=(hands, window), daemon=True).start()
+    return {"running": True, "hands": hands, "started": True}
+
+
+def _expand_cfg(cfg):
+    """Expand a strat cfg into the FULL 13×13 grid (explicit combos) for the 6 positions.
+    Positions not in the cfg fall back to the chosen base (std/wide). Uses decide_system7
+    as the single source of truth for ranges + token expansion (never re-implemented in JS)."""
+    import sys as _sys
+    _sys.path.insert(0, HERE)
+    import decide_system7 as _D
+    base = (cfg or {}).get("base")
+    src = _D.OPENING_RANGES_WIDE if base == "wide" else _D.OPENING_RANGES_STD
+    cr = (cfg or {}).get("opening_ranges") or {}
+    ranges = {}
+    for pos in _POS6:
+        toks = cr.get(pos)
+        if isinstance(toks, list):
+            try:
+                combos = _D._expand([str(t) for t in toks])
+            except Exception:
+                combos = set(src.get(pos, set()))
+        else:
+            combos = set(src.get(pos, set()))
+        ranges[pos] = sorted(combos)
+    return ranges
+
+
+def _expand_classes(tokens):
+    """Expand 3bet token lists ('TT+','AQs+','AQ') to the explicit hand classes the engine
+    matches literally (decide_system7 uses threebet_value/bluff as a set of `cls`, not ranges)."""
+    import sys as _sys
+    _sys.path.insert(0, HERE)
+    import decide_system7 as _D
+    out = set()
+    for t in (tokens or []):
+        t = str(t).strip()
+        if not t:
+            continue
+        base = t[:-1] if t.endswith("+") else t
+        if t.endswith("+") and (len(base) == 3 or (len(base) == 2 and base[0] == base[1])):
+            out |= _D._expand([t])                 # TT+ / AQs+ / KTo+
+        elif len(base) == 3 or (len(base) == 2 and base[0] == base[1]):
+            out.add(base)                          # explicit AQs / AKo / pair AA
+        elif len(base) == 2:
+            out |= {base + "s", base + "o"}        # bare AQ / AQ+ -> suited + offsuit
+        else:
+            out.add(base)
+    return sorted(out)
+
+
+def _strat_template(base="std", name=""):
+    """Seed the builder: full expanded ranges + knobs + 3bet for a fresh base (std/wide)
+    or an existing saved strategy (loaded + expanded) so the user can edit it visually."""
+    cfg = {}
+    if name and s7_strat and name in s7_strat.names():
+        cfg = s7_strat.load(name) or {}
+        base = cfg.get("base") or base
+    if base not in ("std", "wide"):
+        base = "std"
+    if not cfg:
+        cfg = {"base": base}
+    knobs = dict(KN_DEFAULTS)
+    knobs.update({k: v for k, v in (cfg.get("knobs") or {}).items()
+                  if k in KN_DEFAULTS and isinstance(v, (int, float))})
+    return {"name": name or "", "base": base, "ranges": _expand_cfg(cfg),
+            "threebet_value": _expand_classes(cfg.get("threebet_value") or _DEF_3BV),
+            "threebet_bluff": _expand_classes(cfg.get("threebet_bluff") or _DEF_3BB),
+            "knobs": knobs, "knob_limits": {k: list(v) for k, v in KN_LIMITS.items()}}
+
+
+def _save_strat(body):
+    """Persist a user-named, visually-edited strategy. Explicit combos per position + knobs.
+    Blocks reserved names so the std/fijo/wide baselines stay intact."""
+    name = str(body.get("name", "")).strip().lower()
+    if not re.fullmatch(r"[a-z0-9_-]{1,24}", name):
+        return {"error": "nombre inválido (a-z 0-9 _ - , máx 24)"}
+    if name in ("std", "fijo", "wide"):
+        return {"error": "nombre reservado; elige otro"}
+    if not s7_strat:
+        return {"error": "s7_strat no disponible"}
+    base = body.get("base") if body.get("base") in ("std", "wide") else "std"
+    cfg = {"base": base}
+    orr = body.get("opening_ranges")
+    if isinstance(orr, dict):
+        cfg["opening_ranges"] = {p: v for p, v in orr.items() if isinstance(v, list)}
+    for k in ("threebet_value", "threebet_bluff"):
+        if isinstance(body.get(k), list):
+            cfg[k] = _expand_classes(body[k])
+    if isinstance(body.get("knobs"), dict):
+        cfg["knobs"] = body["knobs"]
+    clean = _validate_strat(cfg) or {}
+    clean["base"] = base
+    try:
+        s7_strat.save(name, clean)
     except Exception as e:
         return {"error": str(e)}
+    return {"ok": True, "name": name,
+            "positions": {p: len(v) for p, v in (clean.get("opening_ranges") or {}).items()}}
+
+
+def _stratgen_compute(window, mode):
+    """Slow M3 call (background thread): a pro-player persona designs a COMPLETE strategy.
+    mode='leaks' fixes the diagnosed leaks of the window; mode='scratch' = ideal from zero.
+    Writes the editable proposal to _stratgen_cache; does NOT save (the user names + edits)."""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, os.path.join(HERE, "examples"))
+        _sys.path.insert(0, HERE)
+        os.environ.setdefault("S7_STATS_DB", DB)
+        import llm_system7
+        persona = (
+            "Eres un jugador profesional de NLHE 6-max online, ganador, con millones de manos jugadas al año y "
+            "dominio de rangos GTO y de explotación. Diseña una estrategia COMPLETA para un bot de cash 100bb. "
+            "Devuelve un resumen de 1-2 frases y DESPUÉS SOLO un bloque ```json``` con TODAS estas claves: "
+            "opening_ranges con las 6 posiciones UTG,MP,CO,BTN,SB,BB (cada una lista de tokens '22+','A2s+','KTo+' "
+            "o combos explícitos 'AKs'); threebet_value (lista de clases); threebet_bluff (lista); y knobs "
+            "{open_size_bb,threebet_mult,value_eq,station_mult,cbet_bluff_frac,commit_spr,perejil_flop,perejil_turn,"
+            "perejil_relief}. Rangos coherentes y posicionales (UTG tight ~12%, BTN ancho ~45%). Español, conciso.")
+        if mode == "scratch":
+            user = ("Crea tu estrategia IDEAL de jugador pro para 6-max cash 100bb contra un panel near-GTO. "
+                    "No mires ningún histórico: dame tu rango de apertura por posición y tus knobs óptimos.")
+        else:
+            diag = _coach(window)
+            cur = dict(KN_DEFAULTS)
+            try:
+                import decide_system7 as _D
+                cur = {k: _D.KN.get(k, KN_DEFAULTS[k]) for k in KN_DEFAULTS}
+            except Exception:
+                pass
+            leaks = "; ".join("%s: tú %s vs objetivo %s [%s]" % (o["k"], o["you"], o["target"], o["verdict"])
+                              for o in (diag.get("vs_opt") or []))
+            adv = " ".join(diag.get("advice") or [])
+            wt = ("últimas %s manos" % window) if window not in (None, "all", "") else "todas las manos"
+            user = ("Parte de esta config y ARREGLA estos leaks detectados (ventana=%s).\n"
+                    "CONFIG knobs actual: %s\nDIAGNÓSTICO vs óptimo: %s\nCONSEJOS: %s\n"
+                    "Devuelve la estrategia corregida completa (las 6 posiciones)." % (wt, json.dumps(cur), leaks, adv))
+        txt, cerr = None, None
+        if s7_mllm is not None:
+            r = s7_mllm._chat("minimax", os.environ.get("S7_MODEL", "MiniMax-M3"), persona, user, max_tokens=10000)
+            txt, cerr = (None if r.get("error") else (r.get("answer") or "")), r.get("error")
+        else:
+            txt = llm_system7._minimax_call(persona, user, 6000, os.environ.get("S7_MODEL", "MiniMax-M3"))
+        if not txt:
+            _stratgen_cache.update(running=False, ts=time.time(),
+                                   err=("M3: " + cerr) if cerr else "M3 no devolvió respuesta (tokens/clave).")
+            return
+        m = re.search(r"```json\s*(\{.*\})\s*```", txt, re.S) or re.search(r"(\{.*\})\s*$", txt, re.S)
+        cfg = None
+        if m:
+            try:
+                cfg = _validate_strat(json.loads(m.group(1)))
+            except Exception:
+                cfg = None
+        if not cfg:
+            _stratgen_cache.update(running=False, ts=time.time(),
+                                   err="No pude extraer una estrategia válida de la respuesta del modelo.")
+            return
+        prose = (txt[:m.start()].strip() if m else "")[:1200]
+        base = "std"
+        knobs = dict(KN_DEFAULTS)
+        knobs.update({k: v for k, v in (cfg.get("knobs") or {}).items()
+                      if k in KN_DEFAULTS and isinstance(v, (int, float))})
+        data = {"ranges": _expand_cfg({"base": base, "opening_ranges": cfg.get("opening_ranges")}),
+                "threebet_value": _expand_classes(cfg.get("threebet_value") or _DEF_3BV),
+                "threebet_bluff": _expand_classes(cfg.get("threebet_bluff") or _DEF_3BB),
+                "knobs": knobs, "knob_limits": {k: list(v) for k, v in KN_LIMITS.items()},
+                "base": base, "prose": prose, "mode": mode}
+        _stratgen_cache.update(running=False, ts=time.time(), err=None, data=data, window=window, mode=mode)
+    except Exception as e:
+        _stratgen_cache.update(running=False, err=str(e), ts=time.time())
+
+
+def _stratgen_llm(window=None, mode="leaks"):
+    """Non-blocking orchestrator for the pro-player strategy generator (mirrors _coach_llm)."""
+    if mode not in ("leaks", "scratch"):
+        mode = "leaks"
+    if mode == "leaks":
+        hands = 0
+        try:
+            cc = _ro()
+            hands = cc.execute("select count(distinct hand_key) from decisions").fetchone()[0]
+            cc.close()
+        except Exception:
+            pass
+        if hands < COACH_NEED:
+            return {"locked": True, "hands": hands, "need": COACH_NEED}
+    c = _stratgen_cache
+    if c.get("running"):
+        return {"running": True}
+    if c.get("data") and c.get("window") == window and c.get("mode") == mode and time.time() - c["ts"] < 900:
+        return dict(c["data"], cached=True)
+    if c.get("err") and time.time() - c["ts"] < 30:
+        return {"error": c["err"]}
+    c.update(running=True, window=window, mode=mode)
+    threading.Thread(target=_stratgen_compute, args=(window, mode), daemon=True).start()
+    return {"running": True, "started": True}
 
 
 def _runs():
-    """Active trainings: fixed arms + transient arena-run-* + per-label progress."""
-    out = [{"unit": "arena-test", "label": "std", "ranges": "std", "engine": "hybrid", "state": _svc("arena-test"), "fixed": True},
-           {"unit": "arena-test-wide", "label": "wide", "ranges": "wide", "engine": "hybrid", "state": _svc("arena-test-wide"), "fixed": True}]
+    """Active trainings: fixed arms (systemd only) + transient arena-run-* + per-label progress."""
+    out = []
+    if s7_jobs.BACKEND == "systemd":            # fixed A/B arms are systemd units; omit in Docker
+        out = [{"unit": "arena-test", "label": "std", "ranges": "std", "engine": "hybrid", "state": _svc("arena-test"), "fixed": True},
+               {"unit": "arena-test-wide", "label": "wide", "ranges": "wide", "engine": "hybrid", "state": _svc("arena-test-wide"), "fixed": True}]
     try:
-        r = subprocess.run(["systemctl", "list-units", "--type=service", "--all", "--no-legend", "--plain", "arena-run-*"],
-                           capture_output=True, text=True, timeout=4).stdout
-        for line in r.splitlines():
-            parts = line.split()
-            if parts and parts[0].startswith("arena-run-"):
-                unit = parts[0]
-                out.append({"unit": unit, "label": unit[len("arena-run-"):].replace(".service", ""),
-                            "ranges": "?", "engine": "?", "state": _svc(unit), "fixed": False})
+        for j in s7_jobs.list_jobs():
+            out.append({"unit": j["unit"], "label": j["label"],
+                        "ranges": "?", "engine": "?", "state": j["state"], "fixed": False})
     except Exception:
         pass
-    seen = {o["label"] for o in out}            # keep claimable clasificatorias visible even if the unit was GC'd
+    seen = {o["label"] for o in out}            # keep claimable clasificatorias visible even if the job was GC'd
     try:
-        for fn in sorted(os.listdir(os.path.join(HERE, ".clasif"))):
+        for fn in sorted(os.listdir(CLASIF_DIR)):
             if fn.endswith(".json") and fn[:-5] not in seen:
                 lbl = fn[:-5]
                 out.append({"unit": "arena-run-" + lbl, "label": lbl,
@@ -580,7 +869,7 @@ def _claim(label):
     if not re.fullmatch(r"[a-z0-9_-]{1,24}", label or ""):
         return {"error": "label inválida"}
     try:
-        with open(os.path.join(HERE, ".clasif", label + ".json"), encoding="utf-8") as f:
+        with open(os.path.join(CLASIF_DIR, label + ".json"), encoding="utf-8") as f:
             creds = json.load(f)
     except Exception:
         return {"error": "sin credenciales guardadas para '" + str(label) + "' (sólo las clasificatorias lanzadas con la tarjeta tras esta versión son reclamables)"}
@@ -600,6 +889,107 @@ def _claim(label):
             "claim_url": url, "raw": data}
 
 
+MLLM_PRESETS = [
+    {"id": "minimax:MiniMax-M3", "provider": "minimax", "label": "MiniMax M3 (actual)"},
+    {"id": "openrouter:openai/gpt-4o", "provider": "openrouter", "label": "GPT-4o"},
+    {"id": "openrouter:openai/gpt-4.1", "provider": "openrouter", "label": "GPT-4.1"},
+    {"id": "openrouter:anthropic/claude-3.7-sonnet", "provider": "openrouter", "label": "Claude 3.7 Sonnet"},
+    {"id": "openrouter:deepseek/deepseek-r1", "provider": "openrouter", "label": "DeepSeek R1"},
+    {"id": "openrouter:google/gemini-2.5-pro", "provider": "openrouter", "label": "Gemini 2.5 Pro"},
+    {"id": "openrouter:meta-llama/llama-3.3-70b-instruct", "provider": "openrouter", "label": "Llama 3.3 70B"},
+    {"id": "openrouter:qwen/qwen-2.5-72b-instruct", "provider": "openrouter", "label": "Qwen 2.5 72B"},
+    {"id": "xiaomi:MiMo-7B-RL", "provider": "xiaomi", "label": "Xiaomi MiMo"},
+]
+
+
+def _mllm_models():
+    prov = {p: bool(s7_mllm and s7_mllm.provider_ready(p)) for p in ("minimax", "openrouter", "xiaomi")}
+    return {"presets": MLLM_PRESETS, "providers": prov}
+
+
+def _mllm_runs():
+    out = []
+    try:
+        c = _ro()
+        for rid, ts, status, models, judge, nh, nr in c.execute(
+                "select run_id,ts,status,models,judge,n_hands,n_reps from mllm_runs order by ts desc limit 50"):
+            n = c.execute("select count(*) from mllm_results where run_id=?", (rid,)).fetchone()[0]
+            out.append({"run_id": rid, "ts": ts, "status": status, "models": _lj(models) or [],
+                        "judge": judge, "n_hands": nh, "n_reps": nr, "results": n})
+        c.close()
+    except Exception:
+        pass
+    return {"runs": out}
+
+
+def _mllm_results(run):
+    from collections import Counter, defaultdict
+    try:
+        c = _ro()
+        rows = c.execute(
+            "select model,provider,hand_key,rep,action,amount,valid,latency_ms,prompt_tokens,"
+            "completion_tokens,reasoning,judge_score,judge_note,m3_action from mllm_results "
+            "where run_id=?", (run,)).fetchall()
+        c.close()
+    except Exception as e:
+        return {"error": str(e)}
+    by_hand = defaultdict(list)
+    for r in rows:
+        by_hand[r[2]].append(r)
+    consensus = {}
+    for hk, rs in by_hand.items():
+        cnt = Counter(r[4] for r in rs if r[6] and r[4])
+        consensus[hk] = cnt.most_common(1)[0][0] if cnt else None
+    agg = defaultdict(lambda: {"n": 0, "valid": 0, "lat": [], "tok": [], "judge": [], "vsM3": 0,
+                               "vsCons": 0, "actions": Counter(), "byhand": defaultdict(Counter)})
+    for model, prov, hk, rep, action, amount, valid, lat, pt, ct, reason, js, jn, m3a in rows:
+        a = agg[model]
+        a["n"] += 1
+        if valid:
+            a["valid"] += 1
+            a["actions"][action] += 1
+            a["byhand"][hk][action] += 1
+            if action == m3a:
+                a["vsM3"] += 1
+            if action == consensus.get(hk):
+                a["vsCons"] += 1
+        if lat is not None:
+            a["lat"].append(lat)
+        if pt or ct:
+            a["tok"].append((pt or 0) + (ct or 0))
+        if js is not None:
+            a["judge"].append(js)
+    models = []
+    for m, x in agg.items():
+        cf = []
+        for hk, cnt in x["byhand"].items():
+            tot = sum(cnt.values())
+            if tot:
+                cf.append(max(cnt.values()) / tot)
+        avg = lambda L: round(sum(L) / len(L), 2) if L else None
+        models.append({
+            "model": m, "n": x["n"],
+            "valid_pct": round(100 * x["valid"] / x["n"], 1) if x["n"] else None,
+            "selfcons_pct": round(100 * sum(cf) / len(cf), 1) if cf else None,
+            "vsM3_pct": round(100 * x["vsM3"] / x["valid"], 1) if x["valid"] else None,
+            "vsCons_pct": round(100 * x["vsCons"] / x["valid"], 1) if x["valid"] else None,
+            "judge_avg": avg(x["judge"]),
+            "lat_ms": round(sum(x["lat"]) / len(x["lat"])) if x["lat"] else None,
+            "tokens": round(sum(x["tok"]) / len(x["tok"])) if x["tok"] else None,
+            "actions": dict(x["actions"])})
+    models.sort(key=lambda z: (z["judge_avg"] is None, -(z["judge_avg"] if z["judge_avg"] is not None else -1)))
+    hands = []
+    for hk, rs in by_hand.items():
+        per = {}
+        for r in rs:
+            mdl = r[0]
+            if mdl not in per or (r[6] and not per[mdl]["valid"]):
+                per[mdl] = {"action": r[4], "amount": r[5], "valid": bool(r[6]),
+                            "reasoning": r[10], "judge": r[11], "note": r[12]}
+        hands.append({"hand_key": hk, "m3_action": rs[0][13], "consensus": consensus.get(hk), "per": per})
+    return {"run": run, "models": models, "hands": hands[:80]}
+
+
 def _rank():
     """My launched clasificatoria agents, ranked by Eval bb/100 (for choosing which to claim)."""
     prog, hands = {}, {}
@@ -614,12 +1004,12 @@ def _rank():
         pass
     rows = []
     try:
-        for fn in sorted(os.listdir(os.path.join(HERE, ".clasif"))):
+        for fn in sorted(os.listdir(CLASIF_DIR)):
             if not fn.endswith(".json"):
                 continue
             lbl = fn[:-5]
             try:
-                with open(os.path.join(HERE, ".clasif", fn), encoding="utf-8") as f:
+                with open(os.path.join(CLASIF_DIR, fn), encoding="utf-8") as f:
                     cr = json.load(f)
             except Exception:
                 cr = {}
@@ -773,6 +1163,10 @@ svg{display:block}
 .rlink:hover{text-decoration:underline}
 @keyframes tp{0%{color:#2ee6a6;text-shadow:0 0 8px rgba(46,230,166,.6)}100%{color:inherit;text-shadow:none}}
 .tickpulse{animation:tp .6s ease-out}
+.mlmodels{display:flex;flex-wrap:wrap;gap:5px}
+.mlmodel{display:inline-flex;align-items:center;gap:4px;border:1px solid var(--bd);border-radius:5px;padding:3px 7px;font-size:11px;cursor:pointer;background:#0a0e13}
+.mlmodel.off{opacity:.4}
+.mlhand{border-top:1px solid var(--bd);padding:5px 0;font-size:11px;line-height:1.9}
 .sdreveal .pc{font-size:11px;padding:1px 4px}
 .street{border:1px solid var(--bd);border-radius:5px;margin-top:8px;overflow:hidden}
 .sthead{background:#0a0e13;padding:4px 9px;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd)}
@@ -799,9 +1193,28 @@ svg{display:block}
 .rform input,.rform select{background:#0a0e13;border:1px solid var(--bd);color:var(--txt);border-radius:4px;padding:3px 7px;font:inherit}
 #r-logunit{background:#0a0e13;border:1px solid var(--bd);color:var(--txt);border-radius:4px;padding:2px 6px;font:inherit;font-size:11px}
 .runlog{background:#07090d;border:1px solid var(--bd);border-radius:4px;padding:8px;max-height:300px;overflow:auto;font-size:10px;line-height:1.45;white-space:pre-wrap;color:#9fb0c0;margin-top:6px}
+.vsopt{width:100%;border-collapse:collapse;font-size:12px}
+.vsopt th{text-align:left;color:var(--dim);text-transform:uppercase;font-size:10px;letter-spacing:.5px;padding:5px 8px;border-bottom:1px solid var(--bd)}
+.vsopt td{padding:4px 8px;border-bottom:1px solid #0e141b}
+.vsopt td.vd{font-weight:700;text-align:center;font-size:14px}
+.chip{display:inline-block;border:1px solid var(--bd);border-radius:4px;padding:2px 9px;margin:0 6px 0 0;cursor:pointer;font-size:11px;color:var(--dim)}
+.chip.on{background:#11202b;color:var(--txt);border-color:var(--blu)}
+.rgwrap{display:flex;flex-wrap:wrap;gap:10px;margin-top:8px}
+.rgpos{border:1px solid var(--bd);border-radius:6px;padding:6px;background:var(--bg)}
+.rgpos h5{margin:0 0 4px;font-size:11px;color:var(--txt);display:flex;justify-content:space-between;gap:10px}
+.rgpos h5 .mut{font-weight:400}
+.rg{border-collapse:collapse}
+.rg td{width:15px;height:15px;font-size:7px;text-align:center;border:1px solid #131a25;color:#5a6678;cursor:pointer;user-select:none;background:#0e1219;line-height:1}
+.rg td.on{background:#b98bff;color:#0a0a0a;border-color:#b98bff;font-weight:700}
+.rg td.pair{background:#161b26}
+.rg td.pair.on{background:#b98bff;color:#0a0a0a}
+.kgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(155px,1fr));gap:8px;margin-top:8px}
+.kgrid label{font-size:11px;color:var(--dim);display:flex;flex-direction:column;gap:2px}
+.kgrid input{background:#0a0e13;border:1px solid var(--bd);color:var(--txt);border-radius:4px;padding:3px 6px;font:inherit;font-size:12px}
+.binp{background:#0a0e13;border:1px solid var(--bd);color:var(--txt);border-radius:4px;padding:4px 7px;font:inherit;font-size:12px}
 </style></head><body>
 <div class="top"><b>SYSTEM&nbsp;7</b><span class="live" id="live">LIVE</span>
-<span class="tabs"><span class="tab on" id="tab-panel" onclick="showTab('panel')">PANEL</span><span class="tab" id="tab-hands" onclick="showTab('hands')">MANOS</span><span class="tab" id="tab-players" onclick="showTab('players')">PLAYERS</span><span class="tab" id="tab-coach" onclick="showTab('coach')">COACH</span><span class="tab" id="tab-run" onclick="showTab('run')">RUN</span><span class="tab" id="tab-rank" onclick="showTab('rank')">RANK</span></span>
+<span class="tabs"><span class="tab on" id="tab-panel" onclick="showTab('panel')">PANEL</span><span class="tab" id="tab-hands" onclick="showTab('hands')">MANOS</span><span class="tab" id="tab-players" onclick="showTab('players')">PLAYERS</span><span class="tab" id="tab-coach" onclick="showTab('coach')">COACH</span><span class="tab" id="tab-run" onclick="showTab('run')">RUN</span><span class="tab" id="tab-rank" onclick="showTab('rank')">RANK</span><span class="tab" id="tab-mllm" onclick="showTab('mllm')">multiLLM</span></span>
 <span class="mut" id="sub">Eval test-bench · panel DeepCFR</span>
 <div class="kpis" id="kpis"></div></div>
 <div id="panelview"><div class="wrap">
@@ -824,6 +1237,7 @@ svg{display:block}
 <div id="coachview" style="display:none"><div id="coach"></div></div>
 <div id="runview" style="display:none"><div id="run"></div></div>
 <div id="rankview" style="display:none"><div id="rankbox"></div></div>
+<div id="mllmview" style="display:none"><div id="mllmbox"></div></div>
 <div class="foot" id="foot"></div>
 <div id="modal" class="modal" onclick="if(event.target===this)closeHand()"><div class="card"></div></div>
 <script>
@@ -1094,12 +1508,13 @@ function playHand(){clearInterval(TMR);const ev=HAND._ev||[],hasRes=!!(HAND.resu
 /* ---------- MANOS tab ---------- */
 let HANDS=[],lastHands=0,HSORT={col:'ts',dir:-1};
 function showTab(t){
- ['panel','hands','players','coach','run','rank'].forEach(v=>{document.getElementById(v+'view').style.display=(v==t)?'':'none';document.getElementById('tab-'+v).classList.toggle('on',v==t);});
+ ['panel','hands','players','coach','run','rank','mllm'].forEach(v=>{document.getElementById(v+'view').style.display=(v==t)?'':'none';document.getElementById('tab-'+v).classList.toggle('on',v==t);});
  if(t=='hands')loadHands();
  if(t=='players')loadPlayers();
  if(t=='coach')loadCoach();
  if(t=='run')loadRuns();
  if(t=='rank')loadRank();
+ if(t=='mllm')loadMLLM();
 }
 let PLAYERS=[];
 async function loadPlayers(){try{const r=await fetch('/api/players');const d=await r.json();PLAYERS=d.players||[];renderPlayers();}catch(e){}}
@@ -1132,31 +1547,125 @@ function renderHands(){
  document.getElementById('hands').innerHTML=html;
 }
 /* ---------- COACH tab ---------- */
+let cwin='all';                 /* ventana del diagnóstico: 'all' | '10000' */
+let brState=null;               /* estado del builder de estrategia */
+const RKS="AKQJT98765432";
+const POS6=['UTG','MP','CO','BTN','SB','BB'];
+function combo(i,j){if(i==j)return RKS[i]+RKS[i];if(i<j)return RKS[i]+RKS[j]+'s';return RKS[j]+RKS[i]+'o';}
 async function loadCoach(){
  const el=document.getElementById('coach');el.innerHTML='<div class="mut" style="padding:14px">cargando…</div>';
- try{const d=await (await fetch('/api/coach')).json();
+ try{const d=await (await fetch('/api/coach?window='+cwin)).json();
+  let h='<div class="pcard"><h4>Diagnóstico · ventana</h4>'
+    +'<span class="chip'+(cwin=='all'?' on':'')+'" data-win="all">todas las manos</span>'
+    +'<span class="chip'+(cwin=='10000'?' on':'')+'" data-win="10000">últimas 10k</span>'
+    +'<span class="mut" style="margin-left:8px">'+(d.win_hands!=null?('analizando '+Number(d.win_hands).toLocaleString()+' manos'):'')+'</span></div>';
   if(d.locked){const pc=Math.min(100,Math.round(100*d.hands/d.need));
-   el.innerHTML='<div class="pcard"><h4>COACH bloqueado 🔒</h4><div class="mut">Se necesitan '+d.need.toLocaleString()+' manos para activar el análisis. Llevas <b>'+d.hands.toLocaleString()+'</b>.</div><div class="track" style="margin-top:8px"><div class="fill" style="width:'+pc+'%;background:var(--grn)"></div><div class="fv">'+pc+'%</div></div></div>';return;}
-  let h='<div class="pcard"><h4>Consejos (reglas)</h4>'+(d.advice||[]).map(a=>'<div class="cadv">▷ '+esc(a)+'</div>').join('')+'</div>';
-  if((d.findings||[]).length)h+='<div class="pcard"><h4>Métricas clave</h4>'+d.findings.map(f=>'<span class="st">'+esc(f.k)+' <b>'+esc(f.v)+'</b> <span class="mut">(ref '+esc(f.ref)+')</span></span>').join('')+'</div>';
-  if((d.posres||[]).length)h+='<div class="pcard"><h4>Ganancia/pérdida por posición</h4>'+d.posres.map(p=>'<span class="st">'+p.pos+' <b style="color:'+((p.delta||0)>=0?"#2ee6a6":"#ff5d5d")+'">'+((p.delta||0)>=0?"+":"")+p.delta+'</b> <span class="mut">('+p.n+'m)</span></span>').join('')+'</div>';
-  if((d.ab||[]).length)h+='<div class="pcard"><h4>A/B estrategias (bb/100)</h4>'+d.ab.map(a=>'<span class="st">'+esc(a.label)+' <b>'+(a.bb100==null?'—':(a.bb100>=0?'+':'')+a.bb100)+'</b> <span class="mut">(n'+a.n+')</span></span>').join('')+'</div>';
-  h+='<div class="pcard"><h4>Coach IA · MiniMax M3</h4><button class="eqbtn on" style="--c:#b98bff" onclick="coachLLM()">🧠 pedir consejo a M3</button><div id="coachllm" style="margin-top:8px;white-space:pre-wrap;font-size:12px;line-height:1.5"></div></div>';
+   h+='<div class="pcard"><h4>Diagnóstico bloqueado 🔒</h4><div class="mut">Se necesitan '+d.need.toLocaleString()+' manos para el análisis de leaks. Llevas <b>'+d.hands.toLocaleString()+'</b>. (Puedes crear una estrategia «ideal desde cero» abajo.)</div><div class="track" style="margin-top:8px"><div class="fill" style="width:'+pc+'%;background:var(--grn)"></div><div class="fv">'+pc+'%</div></div></div>';
+  }else{
+   const vcol=v=>v=='✓'?'#2ee6a6':v=='⚠'?'#f5b73d':v=='✗'?'#ff5d5d':'#5a6675';
+   let pan=d.vs_panel?('<div class="mut" style="margin-bottom:7px">Resultado real vs panel near-GTO (DeepCFR): <b class="'+((d.vs_panel.bb100||0)>=0?'posv':'neg')+'">'+((d.vs_panel.bb100||0)>=0?'+':'')+d.vs_panel.bb100+' bb/100</b> <span class="mut">('+d.vs_panel.runs+' runs · '+Number(d.vs_panel.hands||0).toLocaleString()+' manos)</span></div>'):'';
+   h+='<div class="pcard"><h4>Tu juego vs el mejor juego</h4>'+pan
+     +'<table class="vsopt"><thead><tr><th>métrica</th><th>tú</th><th>óptimo</th><th style="text-align:center">veredicto</th><th>nota</th></tr></thead><tbody>'
+     +(d.vs_opt||[]).map(o=>'<tr><td><b>'+esc(o.k)+'</b></td><td>'+esc(o.you)+'</td><td class="mut">'+esc(o.target)+'</td><td class="vd" style="color:'+vcol(o.verdict)+'">'+esc(o.verdict)+'</td><td class="mut">'+esc(o.note)+'</td></tr>').join('')
+     +'</tbody></table><div class="mut" style="margin-top:6px;font-size:11px">«Mejor juego» = bandas GTO 6-max estándar + resultado real contra el panel near-GTO (no hay solver exacto en el entorno).</div></div>';
+   if((d.advice||[]).length)h+='<div class="pcard"><h4>Consejos (reglas)</h4>'+d.advice.map(a=>'<div class="cadv">▷ '+esc(a)+'</div>').join('')+'</div>';
+   if((d.posres||[]).length)h+='<div class="pcard"><h4>Ganancia/pérdida por posición</h4>'+d.posres.map(p=>'<span class="st">'+p.pos+' <b style="color:'+((p.delta||0)>=0?"#2ee6a6":"#ff5d5d")+'">'+((p.delta||0)>=0?"+":"")+p.delta+'</b> <span class="mut">('+p.n+'m)</span></span>').join('')+'</div>';
+   if((d.ab||[]).length)h+='<div class="pcard"><h4>A/B estrategias (bb/100)</h4>'+d.ab.map(a=>'<span class="st">'+esc(a.label)+' <b>'+(a.bb100==null?'—':(a.bb100>=0?'+':'')+a.bb100)+'</b> <span class="mut">(n'+a.n+')</span></span>').join('')+'</div>';
+  }
+  h+='<div class="pcard"><h4>Coach IA · análisis (MiniMax M3)</h4><button class="eqbtn on" style="--c:#b98bff" onclick="coachLLM()">🧠 pedir consejo a M3</button><div id="coachllm" style="margin-top:8px;white-space:pre-wrap;font-size:12px;line-height:1.5"></div></div>';
+  h+='<div class="pcard"><h4>Crear estrategia · jugador pro 🃏</h4>'
+    +'<div class="rform"><span>base IA:</span>'
+      +'<label><input type="radio" name="sgmode" value="leaks" checked> corregir mis leaks</label>'
+      +'<label><input type="radio" name="sgmode" value="scratch"> ideal desde cero</label>'
+      +'<button class="eqbtn on" style="--c:#b98bff" onclick="genStrategy()">🧠 generar con IA</button>'
+      +'<span style="margin-left:8px">o a mano:</span>'
+      +'<button class="eqbtn" data-tpl="std">✎ plantilla std</button>'
+      +'<button class="eqbtn" data-tpl="wide">✎ plantilla wide</button>'
+      +'<span id="sg-msg" class="mut" style="margin-left:6px"></span></div>'
+    +'<div class="mut" style="margin-top:5px;font-size:11px">La IA propone una estrategia completa; revísala y edítala en la rejilla (clic = añade/quita mano), ajusta las cualidades, ponle nombre y guárdala. Quedará disponible para el agente en RUN/RANK.</div>'
+    +'<div id="builder" style="margin-top:10px"></div></div>';
   el.innerHTML=h;
  }catch(e){el.innerHTML='<div class="mut" style="padding:14px">error cargando coach</div>';}
 }
 async function coachLLM(){
- const o=document.getElementById('coachllm');if(!o)return;o.innerHTML='<span class="mut">consultando a M3 (~30s)…</span>';
- try{const d=await (await fetch('/api/coach/llm')).json();
-  if(d.locked){o.textContent='bloqueado: '+d.hands+'/'+d.need;return;}
-  if(d.error){o.textContent='error: '+d.error;return;}
-  let h='<div style="white-space:pre-wrap">'+esc(d.text||'')+'</div>';
+ const o=document.getElementById('coachllm');if(!o)return;let n=0;
+ const render=d=>{let h='<div style="white-space:pre-wrap">'+esc(d.text||'')+'</div>';
   if(d.version&&d.proposal)h+='<div class="pcard" style="margin-top:8px"><b>Propuesta de versión: '+esc(d.version)+'</b><pre class="runlog" style="max-height:220px">'+esc(JSON.stringify(d.proposal,null,1))+'</pre><button class="eqbtn on" data-launchv="'+esc(d.version)+'">▶ lanzar '+esc(d.version)+' (vs fijo)</button> <span id="cv-msg" class="mut"></span></div>';
-  o.innerHTML=h;
- }catch(e){o.textContent='error consultando M3';}
+  o.innerHTML=h;};
+ const poll=async()=>{
+  try{const d=await (await fetch('/api/coach/llm?window='+cwin)).json();
+   if(d.locked){o.textContent='bloqueado: '+d.hands+'/'+d.need+' manos';return;}
+   if(d.error){o.innerHTML='<span class="neg">error: '+esc(d.error)+'</span>';return;}
+   if(d.running){n++;o.innerHTML='<span class="mut">⏳ M3 está analizando las manos… ('+(n*4)+'s · puede tardar ~60s, no cierres la pestaña)</span>';if(n<75)setTimeout(poll,4000);else o.innerHTML='<span class="neg">M3 tarda demasiado; reintenta.</span>';return;}
+   render(d);
+  }catch(e){o.textContent='error consultando M3';}
+ };
+ o.innerHTML='<span class="mut">⏳ pidiendo análisis a M3…</span>';poll();
 }
 function launchVersion(v){const m=document.getElementById('cv-msg');if(m)m.textContent='lanzando…';
  fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:v,strat:v,engine:'hybrid',matches:5})}).then(r=>r.json()).then(d=>{if(m)m.innerHTML=d.ok?'<span class="posv">lanzado '+esc(d.unit)+'</span>':'<span class="neg">'+esc(d.error||'error')+'</span>';}).catch(()=>{if(m)m.textContent='error';});
+}
+/* ---------- COACH · creador de estrategias ---------- */
+async function genStrategy(){
+ const mode=(document.querySelector('input[name=sgmode]:checked')||{}).value||'leaks';
+ const msg=document.getElementById('sg-msg'),b=document.getElementById('builder');if(!msg)return;let n=0;
+ const poll=async()=>{
+  try{const d=await (await fetch('/api/coach/strategy?window='+cwin+'&mode='+mode)).json();
+   if(d.locked){msg.innerHTML='<span class="neg">bloqueado: '+d.hands+'/'+d.need+' manos (usa «ideal desde cero»)</span>';return;}
+   if(d.error){msg.innerHTML='<span class="neg">error: '+esc(d.error)+'</span>';return;}
+   if(d.running){n++;msg.innerHTML='<span class="mut">⏳ el jugador pro está diseñando la estrategia… ('+(n*4)+'s · ~100s, no cierres)</span>';if(n<75)setTimeout(poll,4000);else msg.innerHTML='<span class="neg">M3 tarda demasiado; reintenta.</span>';return;}
+   msg.innerHTML='<span class="posv">✓ propuesta lista — revísala, nómbrala y guárdala</span>';mountBuilder(d);
+  }catch(e){msg.textContent='error consultando M3';}
+ };
+ msg.innerHTML='<span class="mut">⏳ pidiendo estrategia a M3…</span>';if(b)b.innerHTML='';poll();
+}
+async function loadTemplate(base,name){
+ const msg=document.getElementById('sg-msg');if(msg)msg.innerHTML='<span class="mut">cargando plantilla…</span>';
+ try{const d=await (await fetch('/api/strats/template?base='+encodeURIComponent(base||'std')+(name?('&name='+encodeURIComponent(name)):''))).json();
+  if(msg)msg.innerHTML='';mountBuilder(d);
+ }catch(e){if(msg)msg.textContent='error';}
+}
+function mountBuilder(d){
+ brState={base:d.base||'std',ranges:{},knobs:Object.assign({},d.knobs||{}),limits:d.knob_limits||{},
+          tbv:(d.threebet_value||[]).join(' '),tbb:(d.threebet_bluff||[]).join(' ')};
+ POS6.forEach(p=>{brState.ranges[p]=new Set((d.ranges&&d.ranges[p])||[]);});
+ renderBuilder(d.prose||'');
+}
+function gridHTML(p){
+ const set=brState.ranges[p];let cells='';
+ for(let i=0;i<13;i++){cells+='<tr>';for(let j=0;j<13;j++){const cmb=combo(i,j);const on=set.has(cmb);
+  cells+='<td class="'+(i==j?'pair':'')+(on?' on':'')+'" data-pos="'+p+'" data-cmb="'+cmb+'">'+cmb.slice(0,2)+'</td>';}cells+='</tr>';}
+ return '<div class="rgpos"><h5><span>'+p+'</span><span class="mut" id="cnt-'+p+'">'+set.size+'</span></h5><table class="rg"><tbody>'+cells+'</tbody></table></div>';
+}
+function renderBuilder(prose){
+ const b=document.getElementById('builder');if(!b||!brState)return;let h='';
+ if(prose)h+='<div class="mut" style="margin-bottom:8px;white-space:pre-wrap">'+esc(prose)+'</div>';
+ h+='<div class="rform"><label>nombre <input id="b-name" class="binp" placeholder="ej: pro1" maxlength="24" style="width:120px"></label>'
+   +'<label>base <select id="b-base" class="binp"><option value="std">std</option><option value="wide">wide</option></select></label>'
+   +'<span class="mut">clic en una celda = añade/quita esa mano del rango</span></div>';
+ h+='<div class="rgwrap">'+POS6.map(p=>gridHTML(p)).join('')+'</div>';
+ const klab={open_size_bb:'tamaño apertura (bb)',threebet_mult:'multiplicador 3bet',value_eq:'equity de valor',station_mult:'mult. vs estación',cbet_bluff_frac:'frac. cbet farol',commit_spr:'SPR de commit',perejil_flop:'perejil flop',perejil_turn:'perejil turn',perejil_relief:'perejil alivio'};
+ h+='<h5 style="margin:12px 0 0;font-size:11px;color:var(--txt)">Cualidades (knobs)</h5><div class="kgrid">'
+   +Object.keys(klab).map(k=>{const lim=brState.limits[k]||[0,99];const v=brState.knobs[k];return '<label>'+klab[k]+' <span class="mut">('+lim[0]+'–'+lim[1]+')</span><input type="number" step="0.05" id="k-'+k+'" value="'+(v==null?'':v)+'" min="'+lim[0]+'" max="'+lim[1]+'"></label>';}).join('')+'</div>';
+ h+='<div class="rform" style="margin-top:10px"><label>3bet valor <input id="tb-value" class="binp" style="width:300px" value="'+esc(brState.tbv)+'"></label>'
+   +'<label>3bet farol <input id="tb-bluff" class="binp" style="width:300px" value="'+esc(brState.tbb)+'"></label></div>';
+ h+='<div class="rform" style="margin-top:10px"><button class="eqbtn on" style="--c:#2ee6a6" onclick="saveStrategy()">💾 guardar estrategia</button><span id="sv-msg" class="mut"></span></div>';
+ b.innerHTML=h;const bs=document.getElementById('b-base');if(bs)bs.value=brState.base;
+}
+async function saveStrategy(){
+ if(!brState)return;const m=document.getElementById('sv-msg');
+ const name=((document.getElementById('b-name')||{}).value||'').trim().toLowerCase();
+ if(!/^[a-z0-9_-]{1,24}$/.test(name)){m.innerHTML='<span class="neg">nombre inválido (a-z 0-9 _ - , máx 24)</span>';return;}
+ const base=(document.getElementById('b-base')||{}).value||'std';
+ const opening={};POS6.forEach(p=>{opening[p]=Array.from(brState.ranges[p]);});
+ const knobs={};Object.keys(brState.limits).forEach(k=>{const el=document.getElementById('k-'+k);if(el&&el.value!=='')knobs[k]=parseFloat(el.value);});
+ const sp=s=>(s||'').split(/[\s,]+/).filter(Boolean);
+ const body={name:name,base:base,opening_ranges:opening,knobs:knobs,threebet_value:sp((document.getElementById('tb-value')||{}).value),threebet_bluff:sp((document.getElementById('tb-bluff')||{}).value)};
+ m.innerHTML='<span class="mut">guardando…</span>';
+ try{const d=await (await fetch('/api/strats/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  if(d.ok)m.innerHTML='<span class="posv">✓ guardada «'+esc(d.name)+'» — disponible en RUN. </span><button class="eqbtn" data-test="'+esc(d.name)+'">▶ probar (clasificatoria 500)</button>';
+  else m.innerHTML='<span class="neg">'+esc(d.error||'error')+'</span>';
+ }catch(e){m.textContent='error';}
 }
 /* ---------- RUN tab ---------- */
 function loadRuns(){
@@ -1177,6 +1686,14 @@ function loadRuns(){
     '<button class="eqbtn on" onclick="launchClasif()">▶ jugar 500 clasificatorias</button></div>'+
    '<div class="mut" style="margin-top:5px">Juega UNA partida Eval de 500 manos (seed_poker_eval_s1) contra el panel near-GTO con la versión elegida, registrando un agente nuevo con ese nombre. El Eval es one-shot por agente; el resultado (bb/100) aparece abajo y en la curva de equity.</div>'+
    '<div id="c-msg" class="mut" style="margin-top:6px"></div></div>'+
+  '<div class="pcard"><h4>🧪 Multi-run · lote de clasificatorias</h4>'+
+   '<div class="rform">versión <select id="b-strat"><option value="wide">wide</option></select>'+
+    'motor <select id="b-engine"><option>hybrid</option><option>heur</option></select>'+
+    'nº runs <input id="b-total" type="number" value="20" min="1" max="300" style="width:64px">'+
+    'a la vez <input id="b-maxc" type="number" value="4" min="1" max="8" style="width:52px">'+
+    '<button class="eqbtn on" onclick="launchBatch()">▶ lanzar lote</button></div>'+
+   '<div class="mut" style="margin-top:5px">Lanza N clasificatorias de 500 manos (reclamables) en oleadas, igual que por CLI. Aparecen en RANK conforme terminan. El runner «batch-…» sale abajo en la lista (botón parar para cortarlo).</div>'+
+   '<div id="b-msg" class="mut" style="margin-top:6px"></div></div>'+
   '<div class="pcard"><h4>Entrenamientos</h4>'+
    '<div class="rform" style="margin:0 0 7px"><button class="eqbtn" data-clean="stopall">⏹ parar todas</button>'+
     '<button class="eqbtn" data-clean="failed">🧹 limpiar fallidas</button>'+
@@ -1185,7 +1702,7 @@ function loadRuns(){
    '<div id="r-list" class="mut">cargando…</div></div>'+
   '<div class="pcard"><h4>Debug en vivo · <select id="r-logunit" onchange="pollLog()"></select></h4><pre id="r-log" class="runlog">selecciona un entrenamiento…</pre></div>';
  refreshRuns();
- fetch('/api/strats').then(r=>r.json()).then(d=>{const opts=(d.strats||[]).map(x=>'<option>'+esc(x.name)+'</option>').join('');const s=document.getElementById('r-strat');if(s)s.innerHTML='<option value="">(usar rangos)</option>'+opts;const c=document.getElementById('c-strat');if(c)c.innerHTML=opts||'<option value="std">std</option>';}).catch(()=>{});
+ fetch('/api/strats').then(r=>r.json()).then(d=>{const opts=(d.strats||[]).map(x=>'<option>'+esc(x.name)+'</option>').join('');const s=document.getElementById('r-strat');if(s)s.innerHTML='<option value="">(usar rangos)</option>'+opts;const c=document.getElementById('c-strat');if(c)c.innerHTML=opts||'<option value="std">std</option>';const b=document.getElementById('b-strat');if(b){b.innerHTML=opts||'<option value="wide">wide</option>';b.value='wide';}}).catch(()=>{});
 }
 async function refreshRuns(){
  const el=document.getElementById('r-list');if(!el)return;
@@ -1203,6 +1720,15 @@ async function pollLog(){
   pre.textContent=d.log||d.error||'(sin salida todavía)';
   if(atBottom)pre.scrollTop=pre.scrollHeight;
  }catch(e){}
+}
+async function launchBatch(){
+ const m=document.getElementById('b-msg');
+ const body={strat:(document.getElementById('b-strat')||{}).value||'wide',engine:document.getElementById('b-engine').value,total:+document.getElementById('b-total').value||20,maxc:+document.getElementById('b-maxc').value||4};
+ m.textContent='lanzando lote…';
+ try{const d=await (await fetch('/api/run/batch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})).json();
+  m.innerHTML=d.ok?('<span class="posv">▶ lote lanzado: '+esc(d.unit)+' — '+d.total+' runs de <b>'+esc(body.strat)+'</b> ('+body.maxc+' a la vez)</span>'):('<span class="neg">'+esc(d.error||'error')+'</span>');
+  if(d.ok)setTimeout(refreshRuns,1000);
+ }catch(e){m.textContent='error';}
 }
 async function launchRun(){
  const m=document.getElementById('r-msg');
@@ -1230,7 +1756,17 @@ document.addEventListener('keydown',e=>{if(e.key=='Escape')closeHand();});
 document.getElementById('tick').addEventListener('click',e=>{const row=e.target.closest('[data-k]');if(row&&row.dataset.k)openHand(decodeURIComponent(row.dataset.k));});
 document.getElementById('hands').addEventListener('click',e=>{const th=e.target.closest('th[data-sort]');if(th){const cc=th.dataset.sort;if(HSORT.col==cc)HSORT.dir*=-1;else{HSORT.col=cc;HSORT.dir=(cc=='ts'||cc=='delta'||cc=='pot')?-1:1;}renderHands();return;}const row=e.target.closest('tr[data-k]');if(row&&row.dataset.k)openHand(decodeURIComponent(row.dataset.k));});
 document.getElementById('players').addEventListener('click',e=>{const el=e.target.closest('[data-k]');if(el&&el.dataset.k)openHand(decodeURIComponent(el.dataset.k));});
-document.getElementById('coach').addEventListener('click',e=>{const b=e.target.closest('[data-launchv]');if(b)launchVersion(b.dataset.launchv);});
+document.getElementById('coach').addEventListener('click',e=>{
+ const cell=e.target.closest('td[data-cmb]');
+ if(cell&&brState&&brState.ranges[cell.dataset.pos]){const p=cell.dataset.pos,cmb=cell.dataset.cmb,set=brState.ranges[p];
+  if(set.has(cmb)){set.delete(cmb);cell.classList.remove('on');}else{set.add(cmb);cell.classList.add('on');}
+  const cnt=document.getElementById('cnt-'+p);if(cnt)cnt.textContent=set.size;return;}
+ const wb=e.target.closest('[data-win]');if(wb){cwin=wb.dataset.win;loadCoach();return;}
+ const tp=e.target.closest('[data-tpl]');if(tp){loadTemplate(tp.dataset.tpl);return;}
+ const tb=e.target.closest('[data-test]');
+ if(tb){const nm=tb.dataset.test,label=('clasif-'+nm).slice(0,18)+'-'+(Date.now()%10000);tb.textContent='lanzando…';
+  fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:label,strat:nm,ranges:'std',engine:'hybrid',matches:1,name:nm})}).then(r=>r.json()).then(d=>{tb.textContent=d.ok?('▶ lanzada ('+d.unit+')'):(d.error||'error');}).catch(()=>{tb.textContent='error';});return;}
+ const b=e.target.closest('[data-launchv]');if(b)launchVersion(b.dataset.launchv);});
 document.getElementById('eqctl').addEventListener('click',e=>{const b=e.target.closest('[data-eq]');if(!b)return;const k=b.dataset.eq;if(k=='__ev')EQOPT.ev=!EQOPT.ev;else EQOPT.off[k]=!EQOPT.off[k];drawEquity();});
 document.getElementById('run').addEventListener('click',async e=>{
  const sb=e.target.closest('[data-stop]');
@@ -1250,13 +1786,81 @@ async function tick(){let d;try{const r=await fetch('/api/state');d=await r.json
  try{render(d);$('#live').textContent='LIVE';$('#live').classList.add('live');}catch(e){$('#live').textContent='ERR';console.error('render error:',e);}
  if(document.getElementById('handsview').style.display!=='none'&&Date.now()-lastHands>10000)loadHands();
  if(document.getElementById('runview').style.display!=='none')refreshRuns();
- if(document.getElementById('rankview')&&document.getElementById('rankview').style.display!=='none')refreshRank();}
+ if(document.getElementById('rankview')&&document.getElementById('rankview').style.display!=='none')refreshRank();
+ if(document.getElementById('mllmview')&&document.getElementById('mllmview').style.display!=='none')refreshMLLM();}
 tick();setInterval(tick,3000);
 async function liveTick(){try{const d=await (await fetch('/api/live')).json();if(d.error)return;
  const set=(id,v)=>{const el=$('#'+id);if(el&&el.textContent!=String(v)){el.textContent=v;el.classList.remove('tickpulse');void el.offsetWidth;el.classList.add('tickpulse');}};
  set('kpi-hands',d.hands);set('kpi-dec',d.decisions);if(d.decisions)set('kpi-m3',(Math.round(1000*d.m3/d.decisions)/10)+'%');
 }catch(e){}}
 liveTick();setInterval(liveTick,1000);
+let MLLMMODELS=null,MLLMRUN='';
+function loadMLLM(){
+ document.getElementById('mllmbox').innerHTML=
+  '<div class="pcard"><h4>🤖 multiLLM · benchmark de razonamiento sobre jugadas M3</h4><div id="ml-cfg" class="mut">cargando modelos…</div></div>'+
+  '<div class="pcard"><h4>Benchmarks <span class="mut">(clic para ver resultados)</span></h4><div id="ml-runs" class="mut">cargando…</div></div>'+
+  '<div class="pcard"><h4>Resultados <span class="mut" id="ml-rtitle"></span></h4><div id="ml-res" class="mut">selecciona un benchmark.</div></div>';
+ fetch('/api/mllm/models').then(r=>r.json()).then(d=>{MLLMMODELS=d;renderMLLMConfig();}).catch(()=>{});
+ refreshMLLM();
+}
+function renderMLLMConfig(){
+ const el=document.getElementById('ml-cfg');if(!el||!MLLMMODELS)return;
+ const prov=MLLMMODELS.providers||{};
+ const presets=(MLLMMODELS.presets||[]).map(p=>{const ok=!!prov[p.provider];
+  return '<label class="mlmodel'+(ok?'':' off')+'" title="'+esc(p.id)+(ok?'':' · falta llave en .env')+'"><input type="checkbox" data-mlm="'+esc(p.id)+'"'+(ok?(p.provider=='minimax'?' checked':''):' disabled')+'> '+esc(p.label)+' <span class="mut">'+esc(p.provider)+'</span></label>';}).join('');
+ const judges='<option value="">(sin juez)</option>'+(MLLMMODELS.presets||[]).map(p=>'<option value="'+esc(p.id)+'">'+esc(p.label)+'</option>').join('');
+ el.innerHTML='<div class="mut" style="margin-bottom:4px">Modelos a comparar (en gris = falta la llave en .env):</div><div class="mlmodels">'+presets+'</div>'+
+  '<div class="rform" style="margin-top:8px">añadir <input id="ml-add" placeholder="openrouter:vendor/model" style="width:230px"> <button class="eqbtn" onclick="mllmAdd()">+ añadir</button></div>'+
+  '<div class="rform" style="margin-top:8px">juez <select id="ml-judge">'+judges+'</select> nº manos <input id="ml-hands" type="number" value="10" min="1" max="200" style="width:58px"> reps <input id="ml-reps" type="number" value="3" min="1" max="20" style="width:46px"> <button class="eqbtn on" onclick="launchMLLM()">▶ run benchmark</button> <span id="ml-msg" class="mut"></span></div>'+
+  '<div class="mut" style="margin-top:5px">Toma manos aleatorias con razonamiento M3, reconstruye la jugada y la plantea a los modelos N veces. Coste = manos × modelos × reps × (1+juez). Empieza pequeño.</div>';
+}
+function mllmAdd(){const i=document.getElementById('ml-add'),v=(i.value||'').trim();if(!v)return;
+ if(!/^[A-Za-z0-9_.:\/-]{1,80}$/.test(v)){i.style.borderColor='#ff5d5d';return;}
+ const cont=document.querySelector('#ml-cfg .mlmodels');
+ if(cont){const l=document.createElement('label');l.className='mlmodel';l.innerHTML='<input type="checkbox" data-mlm="'+esc(v)+'" checked> '+esc(v)+' <span class="mut">+</span>';cont.appendChild(l);}
+ i.value='';i.style.borderColor='';
+}
+async function launchMLLM(){
+ const m=document.getElementById('ml-msg');
+ const models=[].slice.call(document.querySelectorAll('#ml-cfg input[data-mlm]:checked')).map(x=>x.dataset.mlm);
+ if(!models.length){m.innerHTML='<span class="neg">selecciona al menos un modelo</span>';return;}
+ const judge=document.getElementById('ml-judge').value,hands=+document.getElementById('ml-hands').value||10,reps=+document.getElementById('ml-reps').value||3;
+ const n=models.length*hands*reps*(judge?2:1);
+ if(n>400&&!confirm('Son ~'+n+' llamadas LLM. ¿Continuar?'))return;
+ m.textContent='lanzando benchmark…';
+ try{const d=await (await fetch('/api/mllm/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models,judge,hands,reps})})).json();
+  m.innerHTML=d.ok?('<span class="posv">▶ '+esc(d.run_id)+' lanzado · '+models.length+' modelos × '+hands+' manos × '+reps+' reps</span>'):('<span class="neg">'+esc(d.error||'error')+'</span>');
+  if(d.ok){MLLMRUN=d.run_id;setTimeout(refreshMLLM,1500);}
+ }catch(e){m.textContent='error';}
+}
+function mlpc(v){return v==null?'—':v+'%';}
+async function refreshMLLM(){
+ const el=document.getElementById('ml-runs');if(!el)return;
+ try{const d=await (await fetch('/api/mllm/runs')).json();const runs=d.runs||[];
+  if(!runs.length){el.innerHTML='<span class="mut">aún no hay benchmarks; configura arriba y pulsa ▶ run.</span>';}
+  else{if(!MLLMRUN)MLLMRUN=runs[0].run_id;
+   el.innerHTML='<table class="htab"><thead><tr><th>run</th><th>estado</th><th>modelos</th><th>manos×reps</th><th>juez</th><th>filas</th></tr></thead><tbody>'+
+    runs.map(r=>'<tr data-mlrun="'+esc(r.run_id)+'" style="cursor:pointer'+(r.run_id==MLLMRUN?';background:rgba(46,230,166,.08)':'')+'"><td><b>'+esc(r.run_id)+'</b></td><td><span class="dot '+(r.status=='running'?'warn':'up')+'"></span>'+esc(r.status)+'</td><td>'+(r.models||[]).length+'</td><td>'+r.n_hands+'×'+r.n_reps+'</td><td>'+(r.judge?'sí':'—')+'</td><td>'+r.results+'</td></tr>').join('')+'</tbody></table>';
+  }
+  renderMLLMResults();
+ }catch(e){el.textContent='error';}
+}
+async function renderMLLMResults(){
+ const el=document.getElementById('ml-res');if(!el||!MLLMRUN)return;
+ const t=document.getElementById('ml-rtitle');if(t)t.textContent='· '+MLLMRUN;
+ try{const d=await (await fetch('/api/mllm/results?run='+encodeURIComponent(MLLMRUN))).json();
+  if(d.error){el.innerHTML='<span class="neg">'+esc(d.error)+'</span>';return;}
+  const ms=d.models||[];
+  if(!ms.length){el.innerHTML='<span class="mut">sin resultados todavía…</span>';return;}
+  let h='<table class="htab"><thead><tr><th>modelo</th><th>juez 0-10</th><th>validez</th><th>autoconsist.</th><th>vs M3</th><th>vs consenso</th><th>latencia</th><th>tokens</th><th>n</th></tr></thead><tbody>'+
+   ms.map(r=>'<tr><td><b>'+esc(r.model)+'</b></td><td><b class="'+((r.judge_avg||0)>=6?'posv':'neg')+'">'+(r.judge_avg==null?'—':r.judge_avg)+'</b></td><td>'+mlpc(r.valid_pct)+'</td><td>'+mlpc(r.selfcons_pct)+'</td><td>'+mlpc(r.vsM3_pct)+'</td><td>'+mlpc(r.vsCons_pct)+'</td><td>'+(r.lat_ms==null?'—':r.lat_ms+'ms')+'</td><td>'+(r.tokens==null?'—':r.tokens)+'</td><td>'+r.n+'</td></tr>').join('')+'</tbody></table>';
+  h+='<div class="mut" style="margin:10px 0 4px">jugadas (acción de cada modelo; pasa el ratón por encima para el razonamiento):</div>';
+  h+=(d.hands||[]).map(hd=>'<div class="mlhand"><span class="mut">'+esc((hd.hand_key||'').slice(0,18))+' · M3=<b>'+esc(hd.m3_action||'?')+'</b> · consenso=<b>'+esc(hd.consensus||'?')+'</b></span><br>'+
+   Object.keys(hd.per||{}).map(mk=>{const p=hd.per[mk];return '<span class="chip" title="'+esc((p.reasoning||'')+(p.note?(' || juez: '+p.note):''))+'">'+esc(mk.split(':').pop().slice(0,16))+': <b>'+esc(p.action||'?')+'</b>'+(p.judge!=null?(' <span class="posv">'+p.judge+'</span>'):'')+'</span>';}).join('')+'</div>').join('');
+  el.innerHTML=h;
+ }catch(e){el.textContent='error';}
+}
+document.getElementById('mllmbox').addEventListener('click',e=>{const tr=e.target.closest('[data-mlrun]');if(tr){MLLMRUN=tr.dataset.mlrun;refreshMLLM();}});
 function loadRank(){
  document.getElementById('rankbox').innerHTML='<div class="pcard"><h4>🏆 Mis agentes en el ranking <span class="mut">(clic en la cabecera para ordenar)</span></h4><div id="rank-list" class="mut">cargando…</div><div id="rank-msg" class="mut" style="margin-top:8px"></div></div>';
  refreshRank();
@@ -1325,11 +1929,25 @@ class H(BaseHTTPRequestHandler):
             key = parse_qs(urlparse(p).query).get("key", [""])[0]
             self._send(json.dumps(_hand(key), default=str), "application/json")
             return
+        if p.startswith("/api/coach/strategy"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(p).query)
+            win = qs.get("window", ["all"])[0]
+            win = None if win in ("all", "", None) else win
+            mode = qs.get("mode", ["leaks"])[0]
+            self._send(json.dumps(_stratgen_llm(win, mode), default=str), "application/json")
+            return
         if p.startswith("/api/coach/llm"):
-            self._send(json.dumps(_coach_llm(), default=str), "application/json")
+            from urllib.parse import urlparse, parse_qs
+            win = parse_qs(urlparse(p).query).get("window", ["all"])[0]
+            win = None if win in ("all", "", None) else win
+            self._send(json.dumps(_coach_llm(win), default=str), "application/json")
             return
         if p.startswith("/api/coach"):
-            self._send(json.dumps(_coach(), default=str), "application/json")
+            from urllib.parse import urlparse, parse_qs
+            win = parse_qs(urlparse(p).query).get("window", ["all"])[0]
+            win = None if win in ("all", "", None) else win
+            self._send(json.dumps(_coach(win), default=str), "application/json")
             return
         if p.startswith("/api/run/log"):
             from urllib.parse import urlparse, parse_qs
@@ -1342,12 +1960,14 @@ class H(BaseHTTPRequestHandler):
             if not re.fullmatch(r"arena-(run-[a-z0-9_-]{1,24}|test|test-wide)(\.service)?", unit):
                 self._send(json.dumps({"error": "unit inválida"}), "application/json")
                 return
-            try:
-                out = subprocess.run(["journalctl", "-u", unit, "-n", str(n), "--no-pager", "-o", "cat"],
-                                     capture_output=True, text=True, timeout=5).stdout
-            except Exception as e:
-                out = "error: " + str(e)
-            self._send(json.dumps({"unit": unit, "log": out}), "application/json")
+            self._send(json.dumps({"unit": unit, "log": s7_jobs.logs(unit, n)}), "application/json")
+            return
+        if p.startswith("/api/strats/template"):
+            from urllib.parse import urlparse, parse_qs
+            qs = parse_qs(urlparse(p).query)
+            base = qs.get("base", ["std"])[0]
+            name = qs.get("name", [""])[0]
+            self._send(json.dumps(_strat_template(base, name), default=str), "application/json")
             return
         if p.startswith("/api/strats"):
             self._send(json.dumps(_strats(), default=str), "application/json")
@@ -1359,6 +1979,17 @@ class H(BaseHTTPRequestHandler):
             return
         if p.startswith("/api/runs"):
             self._send(json.dumps(_runs(), default=str), "application/json")
+            return
+        if p.startswith("/api/mllm/models"):
+            self._send(json.dumps(_mllm_models(), default=str), "application/json")
+            return
+        if p.startswith("/api/mllm/runs"):
+            self._send(json.dumps(_mllm_runs(), default=str), "application/json")
+            return
+        if p.startswith("/api/mllm/results"):
+            from urllib.parse import urlparse, parse_qs
+            run = parse_qs(urlparse(p).query).get("run", [""])[0]
+            self._send(json.dumps(_mllm_results(run), default=str), "application/json")
             return
         if p.startswith("/api/rank"):
             self._send(json.dumps(_rank(), default=str), "application/json")
@@ -1386,11 +2017,14 @@ class H(BaseHTTPRequestHandler):
         def reply(o):
             self._send(json.dumps(o), "application/json")
 
+        if p.startswith("/api/strats/save"):
+            reply(_save_strat(body))
+            return
         if p.startswith("/api/run/stop"):
             unit = str(body.get("unit", ""))
             if re.fullmatch(r"arena-(run-[a-z0-9_-]{1,24}|test|test-wide)(\.service)?", unit):
                 try:
-                    subprocess.run(["systemctl", "stop", unit], timeout=8)
+                    s7_jobs.stop(unit)
                     reply({"ok": True})
                 except Exception as e:
                     reply({"error": str(e)})
@@ -1401,17 +2035,8 @@ class H(BaseHTTPRequestHandler):
             mode = str(body.get("mode", ""))
             if mode not in ("failed", "completed", "stopall", "small"):
                 reply({"error": "mode inválido"}); return
-            units = []
-            try:
-                r = subprocess.run(["systemctl", "list-units", "--type=service", "--all", "--no-legend",
-                                    "--plain", "arena-run-*"], capture_output=True, text=True, timeout=6).stdout
-                for line in r.splitlines():
-                    parts = line.split()
-                    if parts and parts[0].startswith("arena-run-"):
-                        units.append((parts[0], parts[2] if len(parts) > 2 else ""))
-            except Exception as e:
-                reply({"error": str(e)}); return
-            if mode == "small":                    # borrar runs NO activas con < 50 manos (unidad + sus datos)
+            units = [(j["unit"], j["state"]) for j in s7_jobs.list_jobs()]
+            if mode == "small":                    # borrar runs NO activas con < 50 manos (job + sus datos)
                 done, purged = 0, []
                 try:
                     wc = sqlite3.connect(DB, timeout=10)
@@ -1428,11 +2053,8 @@ class H(BaseHTTPRequestHandler):
                         h = 0
                     if h >= 50:
                         continue
-                    try:
-                        subprocess.run(["systemctl", "stop", u], timeout=10)
-                        subprocess.run(["systemctl", "reset-failed", u], timeout=5)
-                    except Exception:
-                        pass
+                    s7_jobs.stop(u)
+                    s7_jobs.cleanup(u)
                     try:
                         for _t in ("decisions", "equity", "runs"):
                             wc.execute("delete from " + _t + " where run_label=?", (label,))
@@ -1440,7 +2062,7 @@ class H(BaseHTTPRequestHandler):
                     except Exception:
                         pass
                     try:
-                        os.remove(os.path.join(HERE, ".clasif", label + ".json"))
+                        os.remove(os.path.join(CLASIF_DIR, label + ".json"))
                     except Exception:
                         pass
                     purged.append(label); done += 1
@@ -1452,14 +2074,63 @@ class H(BaseHTTPRequestHandler):
             for u, active in units:
                 if active not in want:
                     continue
-                try:
-                    subprocess.run(["systemctl", "stop", u], timeout=10)
-                    if mode != "stopall":
-                        subprocess.run(["systemctl", "reset-failed", u], timeout=5)
-                    done += 1
-                except Exception:
-                    pass
+                s7_jobs.stop(u)
+                if mode != "stopall":
+                    s7_jobs.cleanup(u)
+                done += 1
             reply({"ok": True, "mode": mode, "count": done})
+            return
+        if p.startswith("/api/mllm/run"):
+            models = body.get("models") or []
+            judge = str(body.get("judge", "")).strip()
+            try:
+                hands = max(1, min(200, int(body.get("hands", 10))))
+            except Exception:
+                hands = 10
+            try:
+                reps = max(1, min(20, int(body.get("reps", 3))))
+            except Exception:
+                reps = 3
+            if not isinstance(models, list) or not models:
+                reply({"error": "selecciona al menos un modelo"}); return
+            clean = [str(m).strip() for m in models if re.fullmatch(r"[A-Za-z0-9_.:/-]{1,80}", str(m).strip())]
+            if not clean:
+                reply({"error": "modelos inválidos"}); return
+            if judge and not re.fullmatch(r"[A-Za-z0-9_.:/-]{1,80}", judge):
+                reply({"error": "juez inválido"}); return
+            rid = "mllm-" + time.strftime("%m%d-%H%M%S")
+            argv = s7_jobs.pyrun("s7_mllm.py", "--run-id", rid, "--models", ",".join(clean),
+                                 "--hands", hands, "--reps", reps)
+            if judge:
+                argv += ["--judge", judge]
+            try:
+                unit = s7_jobs.launch(rid, argv, {"S7_STATS_DB": DB})
+            except Exception as e:
+                reply({"error": str(e)[:300]}); return
+            reply({"ok": True, "run_id": rid, "unit": unit})
+            return
+        if p.startswith("/api/run/batch"):
+            strat = str(body.get("strat", "")).strip().lower()
+            engine = str(body.get("engine", "hybrid"))
+            try:
+                total = max(1, min(300, int(body.get("total", 20))))
+            except Exception:
+                total = 20
+            try:
+                maxc = max(1, min(8, int(body.get("maxc", 4))))
+            except Exception:
+                maxc = 4
+            if engine not in ("hybrid", "heur"):
+                reply({"error": "engine inválido"}); return
+            if not strat or (s7_strat and strat not in s7_strat.names()):
+                reply({"error": "versión inválida o inexistente"}); return
+            tag = "b" + ("%05x" % (int(time.time() * 1000) % (16 ** 5)))
+            argv = s7_jobs.pyrun("s7_batch.py", total, maxc, strat, engine, tag)
+            try:
+                unit = s7_jobs.launch("batch-" + tag, argv, {"S7_STATS_DB": DB})
+            except Exception as e:
+                reply({"error": str(e)[:300]}); return
+            reply({"ok": True, "unit": unit, "tag": tag, "total": total})
             return
         if p.startswith("/api/run"):
             label = str(body.get("label", "")).strip().lower()
@@ -1478,36 +2149,31 @@ class H(BaseHTTPRequestHandler):
             name = str(body.get("name", "")).strip()
             if name and not re.fullmatch(r"[A-Za-z0-9 ._-]{1,32}", name):
                 reply({"error": "nombre inválido (A-Z 0-9 espacio . _ - , máx 32)"}); return
-            cmd = ["systemd-run", "--unit=arena-run-" + label, "--working-directory=" + HERE,
-                   "--setenv=HOME=" + HERE, "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
-                   "--setenv=PYTHONUNBUFFERED=1", "--setenv=S7_STATS_DB=" + DB,
-                   "--setenv=S7_RUN_LABEL=" + label, "--setenv=S7_RANGES=" + ranges]
+            env = {"S7_STATS_DB": DB, "S7_RUN_LABEL": label, "S7_RANGES": ranges}
             if strat:
-                cmd.append("--setenv=S7_STRAT=" + strat)
+                env["S7_STRAT"] = strat
             if name:
-                cmd.append("--setenv=S7_AGENT_NAME=" + name)
+                env["S7_AGENT_NAME"] = name
             if label.startswith("clasif"):        # clasificatoria → persist creds for the claim flow
-                cmd.append("--setenv=S7_SAVE_CREDS=1")
+                env["S7_SAVE_CREDS"] = "1"
             try:
                 mt = int(body.get("max_tokens") or 0)
                 if mt > 0:
-                    cmd.append("--setenv=S7_MAX_TOKENS=" + str(mt))
+                    env["S7_MAX_TOKENS"] = str(mt)
             except Exception:
                 pass
             try:
                 md = int(body.get("min_deadline") or 0)
                 if md > 0:
-                    cmd.append("--setenv=S7_LLM_MIN_DEADLINE=" + str(md))
+                    env["S7_LLM_MIN_DEADLINE"] = str(md)
             except Exception:
                 pass
-            cmd += ["/usr/local/bin/uv", "run", "s7_test.py", "--engine", engine, "--matches", str(matches)]
+            argv = s7_jobs.pyrun("s7_test.py", "--engine", engine, "--matches", matches)
             try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-                if r.returncode != 0:
-                    reply({"error": (r.stderr or "systemd-run falló")[:300]}); return
+                unit = s7_jobs.launch(label, argv, env)
             except Exception as e:
-                reply({"error": str(e)}); return
-            reply({"ok": True, "unit": "arena-run-" + label})
+                reply({"error": str(e)[:300]}); return
+            reply({"ok": True, "unit": unit})
             return
         self.send_response(404)
         self.end_headers()

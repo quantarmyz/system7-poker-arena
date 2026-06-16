@@ -13,7 +13,8 @@ import json
 import os
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DIR = os.path.join(HERE, "strategies")
+# S7_STRAT_DIR lets the strategies live on a volume (Docker); defaults to ./strategies.
+DIR = os.environ.get("S7_STRAT_DIR") or os.path.join(HERE, "strategies")
 
 
 def load(name=None):

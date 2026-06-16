@@ -27,7 +27,7 @@ dist/
 .venv/
 venv/
 .uv/
-uv.lock
+# uv.lock IS committed (reproducible Docker builds: the Dockerfile COPYs it).
 
 # Tests — keep test_smoke.py + test_llm_parser.py committed; ignore cache artifacts only
 .pytest_cache/
@@ -44,16 +44,13 @@ htmlcov/
 .omc/
 .claude/
 .aider*
+.clasif/
 
-# ── System 7 runtime artifacts (regenerated locally) ──
+# Runtime data (Docker volume / local runs) — never commit
 *.db
 *.db-shm
 *.db-wal
 *.bak.*.db
-*.log
+data/
+.jobs/
 report.md
-first_table.json
-strategies/coach-*.json
-
-# clasificatoria agent creds (apiKeys — never publish)
-.clasif/

@@ -191,7 +191,7 @@ def run_match(c, decide, engine, max_hands, label):
     agent_id = body.get("agentId") or body.get("id")
     if os.environ.get("S7_SAVE_CREDS"):           # clasificatoria: persist creds so the agent can be claimed later
         try:
-            _cd = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clasif")
+            _cd = os.environ.get("S7_CLASIF_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clasif")
             os.makedirs(_cd, exist_ok=True)
             with open(os.path.join(_cd, label + ".json"), "w", encoding="utf-8") as _f:
                 json.dump({"handle": h, "name": os.environ.get("S7_AGENT_NAME") or "S7 test",
