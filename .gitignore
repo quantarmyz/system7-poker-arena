@@ -54,3 +54,6 @@ htmlcov/
 report.md
 first_table.json
 strategies/coach-*.json
+
+# clasificatoria agent creds (apiKeys — never publish)
+.clasif/

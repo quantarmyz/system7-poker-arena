@@ -1,0 +1,10 @@
+{
+  "base": "std",
+  "knobs": {
+    "open_size_bb": 2.7,
+    "value_eq": 0.68,
+    "cbet_bluff_frac": 0.22,
+    "station_mult": 1.1,
+    "commit_spr": 3.5
+  }
+}

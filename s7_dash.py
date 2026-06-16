@@ -538,6 +538,16 @@ def _runs():
                             "ranges": "?", "engine": "?", "state": _svc(unit), "fixed": False})
     except Exception:
         pass
+    seen = {o["label"] for o in out}            # keep claimable clasificatorias visible even if the unit was GC'd
+    try:
+        for fn in sorted(os.listdir(os.path.join(HERE, ".clasif"))):
+            if fn.endswith(".json") and fn[:-5] not in seen:
+                lbl = fn[:-5]
+                out.append({"unit": "arena-run-" + lbl, "label": lbl,
+                            "ranges": "wide" if "wide" in lbl else "?", "engine": "?",
+                            "state": _svc("arena-run-" + lbl), "fixed": False, "claimable": True})
+    except Exception:
+        pass
     prog = {}
     try:
         c = _ro()
@@ -563,6 +573,77 @@ def _strats():
         pass
     return {"strats": [{"name": nm, "runs": res.get(nm, {}).get("runs", 0),
                         "bb100": res.get(nm, {}).get("bb100")} for nm in names]}
+
+
+def _claim(label):
+    """Fetch the dev.fun claim URL for a saved clasificatoria agent (links it to the user's account)."""
+    if not re.fullmatch(r"[a-z0-9_-]{1,24}", label or ""):
+        return {"error": "label inválida"}
+    try:
+        with open(os.path.join(HERE, ".clasif", label + ".json"), encoding="utf-8") as f:
+            creds = json.load(f)
+    except Exception:
+        return {"error": "sin credenciales guardadas para '" + str(label) + "' (sólo las clasificatorias lanzadas con la tarjeta tras esta versión son reclamables)"}
+    try:
+        import urllib.request
+        req = urllib.request.Request("https://arena.dev.fun/api/arena/auth/claim/status",
+                                     headers={"x-arena-api-key": creds.get("apiKey", "")})
+        with urllib.request.urlopen(req, timeout=15) as r:
+            data = json.loads(r.read().decode())
+    except Exception as e:
+        return {"error": "fallo al consultar claim: " + str(e)[:200]}
+    url = None
+    if isinstance(data, dict):
+        url = (data.get("claimUrl") or data.get("url") or data.get("claim_url")
+               or (data.get("data") or {}).get("claimUrl"))
+    return {"label": label, "agentId": creds.get("agentId"), "name": creds.get("name"),
+            "claim_url": url, "raw": data}
+
+
+def _rank():
+    """My launched clasificatoria agents, ranked by Eval bb/100 (for choosing which to claim)."""
+    prog, hands = {}, {}
+    try:
+        c = _ro()
+        for lbl, m in c.execute("select run_label,avg(adjusted_bb100) from runs group by run_label"):
+            prog[lbl] = round(m, 1) if m is not None else None
+        for lbl, h in c.execute("select run_label,count(distinct hand_key) from decisions group by run_label"):
+            hands[lbl] = h
+        c.close()
+    except Exception:
+        pass
+    rows = []
+    try:
+        for fn in sorted(os.listdir(os.path.join(HERE, ".clasif"))):
+            if not fn.endswith(".json"):
+                continue
+            lbl = fn[:-5]
+            try:
+                with open(os.path.join(HERE, ".clasif", fn), encoding="utf-8") as f:
+                    cr = json.load(f)
+            except Exception:
+                cr = {}
+            strat = cr.get("strat") or (lbl.split("-")[1] if len(lbl.split("-")) >= 2 else "?")
+            rows.append({"label": lbl, "name": cr.get("name") or lbl, "agentId": cr.get("agentId"),
+                         "strategy": strat, "engine": cr.get("engine"), "hands": hands.get(lbl, 0),
+                         "bb100": prog.get(lbl), "state": _svc("arena-run-" + lbl), "ts": cr.get("ts")})
+    except Exception:
+        pass
+    rows.sort(key=lambda r: (r["bb100"] is None, -(r["bb100"] if r["bb100"] is not None else -1e9)))
+    return {"agents": rows}
+
+
+def _live():
+    """Lightweight live counters for the header (cheap, polled ~1s)."""
+    try:
+        c = _ro()
+        dec = c.execute("select count(*) from decisions").fetchone()[0]
+        h = c.execute("select count(distinct hand_key) from decisions").fetchone()[0]
+        m3 = c.execute("select count(*) from decisions where engine='M3'").fetchone()[0]
+        c.close()
+        return {"hands": h, "decisions": dec, "m3": m3}
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def state_cached():
@@ -643,6 +724,7 @@ svg{display:block}
 .armtag{padding:0 6px;border-radius:8px;font-size:9px;border:1px solid var(--bd)}
 .modal{display:none;position:fixed;inset:0;background:rgba(2,4,7,.82);align-items:center;justify-content:center;z-index:50}
 .modal .card{background:var(--pan);border:1px solid var(--grn);border-radius:8px;width:min(760px,95vw);max-height:92vh;overflow:auto;box-shadow:0 0 50px rgba(46,230,166,.18)}
+.modal .card.wide{width:min(1040px,96vw)}
 .mh{padding:8px 12px;border-bottom:1px solid var(--bd);background:#0a0e13}
 .mb{padding:12px}
 .pc{display:inline-block;min-width:17px;padding:2px 4px;margin:0 1.5px;background:linear-gradient(#fff,#e7edf2);color:#15202b;border:1px solid #b9c2c9;border-radius:3px;font-weight:800;text-align:center;box-shadow:0 1px 2px rgba(0,0,0,.45)}
@@ -689,6 +771,8 @@ svg{display:block}
 .sdgap{background:#3a2a05;border:1px solid #6b5300;color:#ffd877;padding:6px 9px;border-radius:6px;margin-bottom:7px;font-size:11.5px;line-height:1.5}
 .rlink{color:#7fd6ff;text-decoration:none;margin-left:10px;font-size:12px}
 .rlink:hover{text-decoration:underline}
+@keyframes tp{0%{color:#2ee6a6;text-shadow:0 0 8px rgba(46,230,166,.6)}100%{color:inherit;text-shadow:none}}
+.tickpulse{animation:tp .6s ease-out}
 .sdreveal .pc{font-size:11px;padding:1px 4px}
 .street{border:1px solid var(--bd);border-radius:5px;margin-top:8px;overflow:hidden}
 .sthead{background:#0a0e13;padding:4px 9px;font-size:10px;letter-spacing:1.5px;text-transform:uppercase;color:var(--dim);border-bottom:1px solid var(--bd)}
@@ -717,7 +801,7 @@ svg{display:block}
 .runlog{background:#07090d;border:1px solid var(--bd);border-radius:4px;padding:8px;max-height:300px;overflow:auto;font-size:10px;line-height:1.45;white-space:pre-wrap;color:#9fb0c0;margin-top:6px}
 </style></head><body>
 <div class="top"><b>SYSTEM&nbsp;7</b><span class="live" id="live">LIVE</span>
-<span class="tabs"><span class="tab on" id="tab-panel" onclick="showTab('panel')">PANEL</span><span class="tab" id="tab-hands" onclick="showTab('hands')">MANOS</span><span class="tab" id="tab-players" onclick="showTab('players')">PLAYERS</span><span class="tab" id="tab-coach" onclick="showTab('coach')">COACH</span><span class="tab" id="tab-run" onclick="showTab('run')">RUN</span></span>
+<span class="tabs"><span class="tab on" id="tab-panel" onclick="showTab('panel')">PANEL</span><span class="tab" id="tab-hands" onclick="showTab('hands')">MANOS</span><span class="tab" id="tab-players" onclick="showTab('players')">PLAYERS</span><span class="tab" id="tab-coach" onclick="showTab('coach')">COACH</span><span class="tab" id="tab-run" onclick="showTab('run')">RUN</span><span class="tab" id="tab-rank" onclick="showTab('rank')">RANK</span></span>
 <span class="mut" id="sub">Eval test-bench · panel DeepCFR</span>
 <div class="kpis" id="kpis"></div></div>
 <div id="panelview"><div class="wrap">
@@ -739,6 +823,7 @@ svg{display:block}
 <div id="playersview" style="display:none"><div id="players"></div></div>
 <div id="coachview" style="display:none"><div id="coach"></div></div>
 <div id="runview" style="display:none"><div id="run"></div></div>
+<div id="rankview" style="display:none"><div id="rankbox"></div></div>
 <div class="foot" id="foot"></div>
 <div id="modal" class="modal" onclick="if(event.target===this)closeHand()"><div class="card"></div></div>
 <script>
@@ -797,10 +882,10 @@ function arm(name,a,color){return '<div class="armbox"><div class="mut">'+name+'
 function render(d){
  if(d.error){$('#sub').textContent='ERROR: '+d.error;}
  $('#kpis').innerHTML=[
-  ['manos',d.hands],['decisiones',d.decisions],
+  ['manos',d.hands,'kpi-hands'],['decisiones',d.decisions,'kpi-dec'],
   ['bb/100 std',sgn(d.ab.std.mean)],['bb/100 wide',sgn(d.ab.wide.mean)],
-  ['M3 %',d.m3pct+'%']
- ].map(k=>'<div class="kpi"><div class="l">'+k[0]+'</div><div class="v">'+k[1]+'</div></div>').join('');
+  ['M3 %',d.m3pct+'%','kpi-m3']
+ ].map(k=>'<div class="kpi"><div class="l">'+k[0]+'</div><div class="v"'+(k[2]?' id="'+k[2]+'"':'')+'>'+k[1]+'</div></div>').join('');
  let verdict='';const s=d.ab.std.mean,w=d.ab.wide.mean;
  if(s!=null&&w!=null){const lead=w>s?'WIDE':'STD';verdict='<div class="mut" style="grid-column:1/3;text-align:center">▲ lidera <b>'+lead+'</b> ('+(w-s>0?'+':'')+(w-s).toFixed(1)+' bb/100) · '+(Math.abs(w-s)< (d.ab.wide.ci||20)?'dentro del ruido':'señal')+'</div>';}
  else verdict='<div class="mut" style="grid-column:1/3;text-align:center">wide aún sin muestra (n='+d.ab.wide.n+')</div>';
@@ -836,7 +921,7 @@ function render(d){
    '<span style="margin-left:auto" class="mut">act '+new Date(d.ts*1000).toLocaleTimeString()+'</span>';
 }
 /* ---------- cards + hand replayer ---------- */
-let HAND=null,STEP=0,TMR=null;
+let HAND=null,STEP=0,TMR=null,EMBED=true,CURURL='';
 function ch(c){if(!c)return'';let r=c.toUpperCase().startsWith('10')?'T':c[0].toUpperCase();const s=c.slice(-1).toLowerCase();const red=(s=='h'||s=='d');const su={h:'♥',d:'♦',s:'♠',c:'♣'}[s]||s;return '<span class="pc" style="color:'+(red?'#d42a32':'#15202b')+'">'+r+su+'</span>';}
 function chs(str){return (str||'').split(/[,\s]+/).filter(Boolean).map(ch).join('');}
 function tstate(evs,step){
@@ -917,8 +1002,11 @@ function buildTimeline(h){
   if(pos>=0)ev.splice(pos+1,0,node);else ev.push(node);});
  return ev;
 }
-async function openHand(key){if(!key)return;try{const r=await fetch('/api/hand?key='+encodeURIComponent(key));HAND=await r.json();HAND._ev=buildTimeline(HAND);STEP=0;document.getElementById('modal').style.display='flex';renderHand();}catch(e){}}
-function closeHand(){clearInterval(TMR);TMR=null;document.getElementById('modal').style.display='none';}
+async function openHand(key){if(!key)return;try{const r=await fetch('/api/hand?key='+encodeURIComponent(key));HAND=await r.json();HAND._ev=buildTimeline(HAND);STEP=0;EMBED=true;document.getElementById('modal').style.display='flex';renderHand();}catch(e){}}
+function closeHand(){clearInterval(TMR);TMR=null;const c=document.querySelector('#modal .card');if(c)c.innerHTML='';document.getElementById('modal').style.display='none';}
+function copyShare(){if(!CURURL)return;const m=document.getElementById('copymsg');const ok=()=>{if(m){m.textContent='✓ copiado';setTimeout(()=>{if(m)m.textContent='';},1400);}};
+ if(navigator.clipboard&&navigator.clipboard.writeText)navigator.clipboard.writeText(CURURL).then(ok).catch(()=>prompt('Copia el enlace:',CURURL));
+ else{const ta=document.createElement('textarea');ta.value=CURURL;ta.style.position='fixed';document.body.appendChild(ta);ta.select();try{document.execCommand('copy');ok();}catch(e){prompt('Copia el enlace:',CURURL);}document.body.removeChild(ta);}}
 function evtxt(e){const s=e.summary||{},st=e.street||'';
  if(e.type=='BlindPosted')return st+' · ciega '+s.amount+' (as.'+s.seatNumber+')';
  if(e.type=='StreetDealt')return st+' · reparto '+chs((s.cards||[]).join(','));
@@ -981,6 +1069,16 @@ function streetSections(h,evs){
  return out;
 }
 function renderHand(){const h=HAND;if(!h)return;
+ const card=document.querySelector('#modal .card');
+ const ru=(h.result&&h.result.replay_url)||'';CURURL=ru;
+ const embed=!!(ru&&EMBED);
+ const share=ru?(' <a class="rlink" href="'+esc(ru)+'" target="_blank" rel="noopener">🔗 abrir en dev.fun</a> <button class="eqbtn" onclick="copyShare()">copiar enlace</button> <button class="eqbtn" onclick="EMBED=!EMBED;renderHand()">'+(embed?'ver reconstrucción local':'ver repro oficial')+'</button> <span id="copymsg" class="mut"></span>'):'';
+ const head='<div class="mh"><b>▶ Reproductor de mano</b> <span class="mut">'+(h.key||'')+'</span>'+share+'<span style="float:right;cursor:pointer" onclick="closeHand()">✕</span></div>';
+ card.classList.toggle('wide',embed);
+ if(embed){
+  card.innerHTML=head+'<div class="mb" style="padding:6px"><iframe src="'+esc(ru)+'" allow="fullscreen" referrerpolicy="no-referrer" style="width:100%;height:74vh;border:0;border-radius:8px;background:#0a0e13"></iframe></div>';
+  return;
+ }
  const ev=h._ev||[];
  const hasRes=!!(h.result&&((h.result.seats_shown||[]).length||(h.result.winners||[]).length));
  const total=ev.length+(hasRes?1:0),maxStep=Math.max(0,total-1);
@@ -989,20 +1087,19 @@ function renderHand(){const h=HAND;if(!h)return;
  const lbl=isResult?'<b style="color:#ffd877">RESULTADO</b>':(ev.length?'<span class="mut">'+evtxt(ev[STEP])+'</span>':'');
  const ctl=ev.length?('<div class="ctl"><button onclick="STEP=Math.max(0,STEP-1);renderHand()">◀ prev</button><button onclick="playHand()">▶ play</button><button onclick="STEP=Math.min('+maxStep+',STEP+1);renderHand()">next ▶▶</button> <span class="mut">paso '+(STEP+1)+' / '+total+'</span> &nbsp; '+lbl+'</div>'):'';
  const fb=ev.length?'':('<div>Tus cartas <span class="big">'+(chs(h.hole)||'?')+'</span> <span class="mut">· asiento '+(my||'?')+'</span></div><div style="margin:8px 0">Board <span class="big">'+(chs((h.board||'').split(/[,\s]+/).filter(Boolean).join(','))||'—')+'</span></div>'+(h.decisions||[]).map(d=>'<span class="chip" style="display:inline-block;margin:2px 3px 0 0">'+d.street+': '+(d.strength||'')+' → <b>'+esc(d.action||'')+'</b>'+(d.amount?(' '+d.amount):'')+'</span>').join(''));
- const rlink=(h.result&&h.result.replay_url)?(' <a class="rlink" href="'+esc(h.result.replay_url)+'" target="_blank" rel="noopener">▶ repro oficial</a>'):'';
- document.querySelector('#modal .card').innerHTML=
-  '<div class="mh"><b>▶ Reproductor de mano</b> <span class="mut">'+(h.key||'')+'</span>'+rlink+'<span style="float:right;cursor:pointer" onclick="closeHand()">✕</span></div>'+
-  '<div class="mb">'+(isResult?showdownBlock(h):'')+(ev.length?minitable(h,ev,STEP):'')+ctl+(ev.length?streetSections(h,ev):fb)+'</div>';
+ const note=ru?'':'<div class="sdgap">repro oficial no disponible para esta mano — reconstrucción local (limitada por la API).</div>';
+ card.innerHTML=head+'<div class="mb">'+note+(isResult?showdownBlock(h):'')+(ev.length?minitable(h,ev,STEP):'')+ctl+(ev.length?streetSections(h,ev):fb)+'</div>';
 }
 function playHand(){clearInterval(TMR);const ev=HAND._ev||[],hasRes=!!(HAND.result&&((HAND.result.seats_shown||[]).length||(HAND.result.winners||[]).length)),max=ev.length+(hasRes?1:0)-1;TMR=setInterval(()=>{if(STEP>=max){clearInterval(TMR);return;}STEP++;renderHand();},850);}
 /* ---------- MANOS tab ---------- */
 let HANDS=[],lastHands=0,HSORT={col:'ts',dir:-1};
 function showTab(t){
- ['panel','hands','players','coach','run'].forEach(v=>{document.getElementById(v+'view').style.display=(v==t)?'':'none';document.getElementById('tab-'+v).classList.toggle('on',v==t);});
+ ['panel','hands','players','coach','run','rank'].forEach(v=>{document.getElementById(v+'view').style.display=(v==t)?'':'none';document.getElementById('tab-'+v).classList.toggle('on',v==t);});
  if(t=='hands')loadHands();
  if(t=='players')loadPlayers();
  if(t=='coach')loadCoach();
  if(t=='run')loadRuns();
+ if(t=='rank')loadRank();
 }
 let PLAYERS=[];
 async function loadPlayers(){try{const r=await fetch('/api/players');const d=await r.json();PLAYERS=d.players||[];renderPlayers();}catch(e){}}
@@ -1073,16 +1170,28 @@ function loadRuns(){
    'M3 deadline <input id="r-dl" type="number" placeholder="30" style="width:64px">'+
    '<button class="eqbtn on" onclick="launchRun()">▶ lanzar</button></div>'+
   '<div id="r-msg" class="mut" style="margin-top:6px"></div></div>'+
-  '<div class="pcard"><h4>Entrenamientos</h4><div id="r-list" class="mut">cargando…</div></div>'+
+  '<div class="pcard"><h4>🏁 Clasificatoria · 500 manos (Eval oficial)</h4>'+
+   '<div class="rform">versión <select id="c-strat"><option value="std">std</option></select>'+
+    'motor <select id="c-engine"><option>hybrid</option><option>heur</option></select>'+
+    'nombre <input id="c-name" placeholder="System 7" maxlength="32" style="width:140px">'+
+    '<button class="eqbtn on" onclick="launchClasif()">▶ jugar 500 clasificatorias</button></div>'+
+   '<div class="mut" style="margin-top:5px">Juega UNA partida Eval de 500 manos (seed_poker_eval_s1) contra el panel near-GTO con la versión elegida, registrando un agente nuevo con ese nombre. El Eval es one-shot por agente; el resultado (bb/100) aparece abajo y en la curva de equity.</div>'+
+   '<div id="c-msg" class="mut" style="margin-top:6px"></div></div>'+
+  '<div class="pcard"><h4>Entrenamientos</h4>'+
+   '<div class="rform" style="margin:0 0 7px"><button class="eqbtn" data-clean="stopall">⏹ parar todas</button>'+
+    '<button class="eqbtn" data-clean="failed">🧹 limpiar fallidas</button>'+
+    '<button class="eqbtn" data-clean="completed">🧹 limpiar completadas</button>'+
+    '<button class="eqbtn" data-clean="small">🗑 borrar &lt;50 manos</button> <span id="rc-msg" class="mut"></span></div>'+
+   '<div id="r-list" class="mut">cargando…</div></div>'+
   '<div class="pcard"><h4>Debug en vivo · <select id="r-logunit" onchange="pollLog()"></select></h4><pre id="r-log" class="runlog">selecciona un entrenamiento…</pre></div>';
  refreshRuns();
- fetch('/api/strats').then(r=>r.json()).then(d=>{const s=document.getElementById('r-strat');if(s)s.innerHTML='<option value="">(usar rangos)</option>'+(d.strats||[]).map(x=>'<option>'+esc(x.name)+'</option>').join('');}).catch(()=>{});
+ fetch('/api/strats').then(r=>r.json()).then(d=>{const opts=(d.strats||[]).map(x=>'<option>'+esc(x.name)+'</option>').join('');const s=document.getElementById('r-strat');if(s)s.innerHTML='<option value="">(usar rangos)</option>'+opts;const c=document.getElementById('c-strat');if(c)c.innerHTML=opts||'<option value="std">std</option>';}).catch(()=>{});
 }
 async function refreshRuns(){
  const el=document.getElementById('r-list');if(!el)return;
  try{const d=await (await fetch('/api/runs')).json();const runs=d.runs||[];
   el.innerHTML='<table class="htab"><thead><tr><th>run</th><th>rangos</th><th>motor</th><th>estado</th><th>partidas</th><th>bb/100</th><th></th></tr></thead><tbody>'+
-   runs.map(r=>{const up=r.state=='active';return '<tr><td><b>'+esc(r.label)+'</b>'+(r.fixed?' <span class=mut>(fijo)</span>':'')+'</td><td>'+(r.ranges||'?')+'</td><td>'+(r.engine||'?')+'</td><td><span class="dot '+(up?'up':(r.state=='activating'?'warn':'down'))+'"></span>'+r.state+'</td><td>'+(r.matches||0)+'</td><td>'+(r.bb100==null?'—':(r.bb100>=0?'+':'')+r.bb100)+'</td><td>'+(up?'<button class="eqbtn" data-stop="'+esc(r.unit)+'">parar</button>':'')+'</td></tr>';}).join('')+'</tbody></table>';
+   runs.map(r=>{const up=r.state=='active';return '<tr><td><b>'+esc(r.label)+'</b>'+(r.fixed?' <span class=mut>(fijo)</span>':'')+'</td><td>'+(r.ranges||'?')+'</td><td>'+(r.engine||'?')+'</td><td><span class="dot '+(up?'up':(r.state=='activating'?'warn':'down'))+'"></span>'+r.state+'</td><td>'+(r.matches||0)+'</td><td>'+(r.bb100==null?'—':(r.bb100>=0?'+':'')+r.bb100)+'</td><td>'+(up?'<button class="eqbtn" data-stop="'+esc(r.unit)+'">parar</button>':'')+(String(r.label||'').indexOf('clasif')==0?' <button class="eqbtn" data-claim="'+esc(r.label)+'">🏆 reclamar</button>':'')+'</td></tr>';}).join('')+'</tbody></table>';
   const sel=document.getElementById('r-logunit');
   if(sel){const cur=sel.value;sel.innerHTML=runs.map(r=>'<option value="'+esc(r.unit)+'">'+esc(r.label)+(r.fixed?'':' (run)')+'</option>').join('');if(cur&&runs.some(r=>r.unit==cur))sel.value=cur;pollLog();}
  }catch(e){el.textContent='error';}
@@ -1104,6 +1213,18 @@ async function launchRun(){
   if(d.ok)setTimeout(refreshRuns,900);
  }catch(e){m.textContent='error';}
 }
+async function launchClasif(){
+ const m=document.getElementById('c-msg');
+ const strat=(document.getElementById('c-strat')||{}).value||'std';
+ const engine=document.getElementById('c-engine').value;
+ const name=(document.getElementById('c-name').value||'').trim();
+ const label=('clasif-'+strat).slice(0,18)+'-'+(Date.now()%10000);
+ m.textContent='lanzando clasificatoria de 500 manos…';
+ try{const d=await (await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label,strat,ranges:'std',engine,matches:1,name})})).json();
+  m.innerHTML=d.ok?'<span class="posv">🏁 clasificatoria lanzada: '+esc(d.unit)+' — 500 manos, versión <b>'+esc(strat)+'</b>'+(name?(' como «'+esc(name)+'»'):'')+'</span>':'<span class="neg">'+esc(d.error||'error')+'</span>';
+  if(d.ok)setTimeout(refreshRuns,900);
+ }catch(e){m.textContent='error';}
+}
 /* ---------- wiring ---------- */
 document.addEventListener('keydown',e=>{if(e.key=='Escape')closeHand();});
 document.getElementById('tick').addEventListener('click',e=>{const row=e.target.closest('[data-k]');if(row&&row.dataset.k)openHand(decodeURIComponent(row.dataset.k));});
@@ -1111,12 +1232,65 @@ document.getElementById('hands').addEventListener('click',e=>{const th=e.target.
 document.getElementById('players').addEventListener('click',e=>{const el=e.target.closest('[data-k]');if(el&&el.dataset.k)openHand(decodeURIComponent(el.dataset.k));});
 document.getElementById('coach').addEventListener('click',e=>{const b=e.target.closest('[data-launchv]');if(b)launchVersion(b.dataset.launchv);});
 document.getElementById('eqctl').addEventListener('click',e=>{const b=e.target.closest('[data-eq]');if(!b)return;const k=b.dataset.eq;if(k=='__ev')EQOPT.ev=!EQOPT.ev;else EQOPT.off[k]=!EQOPT.off[k];drawEquity();});
-document.getElementById('run').addEventListener('click',async e=>{const b=e.target.closest('[data-stop]');if(!b)return;b.textContent='…';try{await fetch('/api/run/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({unit:b.dataset.stop})});}catch(_){}setTimeout(refreshRuns,700);});
+document.getElementById('run').addEventListener('click',async e=>{
+ const sb=e.target.closest('[data-stop]');
+ if(sb){sb.textContent='…';try{await fetch('/api/run/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({unit:sb.dataset.stop})});}catch(_){}setTimeout(refreshRuns,700);return;}
+ const xb=e.target.closest('[data-clean]');
+ if(xb){const mode=xb.dataset.clean,rm=document.getElementById('rc-msg');if(rm)rm.textContent='…';
+  try{const d=await (await fetch('/api/run/clean',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({mode})})).json();
+   if(rm)rm.innerHTML=d.ok?('<span class="posv">'+(mode=='stopall'?'paradas':(mode=='small'?'borradas':'limpiadas'))+': '+d.count+'</span>'):('<span class="neg">'+esc(d.error||'error')+'</span>');
+  }catch(_){if(rm)rm.textContent='error';}setTimeout(refreshRuns,900);return;}
+ const cb=e.target.closest('[data-claim]');
+ if(cb){const lab=cb.dataset.claim,m=document.getElementById('c-msg')||document.getElementById('r-msg');if(m)m.textContent='obteniendo enlace de claim…';
+  try{const d=await (await fetch('/api/claim?label='+encodeURIComponent(lab))).json();
+   if(m)m.innerHTML=d.claim_url?('🏆 <b>'+esc(lab)+'</b> — abre este enlace para reclamar el agente en tu cuenta dev.fun y entrar en la clasificación: <a class="rlink" href="'+esc(d.claim_url)+'" target="_blank" rel="noopener">'+esc(d.claim_url)+'</a>'):('<span class="neg">'+esc(d.error||'sin claim_url')+'</span>');
+  }catch(_){if(m)m.textContent='error';}}
+});
 async function tick(){let d;try{const r=await fetch('/api/state');d=await r.json();}catch(e){$('#live').textContent='OFFLINE';$('#live').classList.remove('live');return;}
  try{render(d);$('#live').textContent='LIVE';$('#live').classList.add('live');}catch(e){$('#live').textContent='ERR';console.error('render error:',e);}
  if(document.getElementById('handsview').style.display!=='none'&&Date.now()-lastHands>10000)loadHands();
- if(document.getElementById('runview').style.display!=='none')refreshRuns();}
+ if(document.getElementById('runview').style.display!=='none')refreshRuns();
+ if(document.getElementById('rankview')&&document.getElementById('rankview').style.display!=='none')refreshRank();}
 tick();setInterval(tick,3000);
+async function liveTick(){try{const d=await (await fetch('/api/live')).json();if(d.error)return;
+ const set=(id,v)=>{const el=$('#'+id);if(el&&el.textContent!=String(v)){el.textContent=v;el.classList.remove('tickpulse');void el.offsetWidth;el.classList.add('tickpulse');}};
+ set('kpi-hands',d.hands);set('kpi-dec',d.decisions);if(d.decisions)set('kpi-m3',(Math.round(1000*d.m3/d.decisions)/10)+'%');
+}catch(e){}}
+liveTick();setInterval(liveTick,1000);
+function loadRank(){
+ document.getElementById('rankbox').innerHTML='<div class="pcard"><h4>🏆 Mis agentes en el ranking <span class="mut">(clic en la cabecera para ordenar)</span></h4><div id="rank-list" class="mut">cargando…</div><div id="rank-msg" class="mut" style="margin-top:8px"></div></div>';
+ refreshRank();
+}
+let RANKDATA=[],RSORT={col:'bb100',dir:-1};
+function sortRank(arr){const c=RSORT.col,d=RSORT.dir;
+ const val=r=>c=='fecha'?(r.ts||0):c=='bb100'?(r.bb100==null?-1e9:r.bb100):c=='manos'?(r.hands||0):c=='nombre'?String(r.name||r.label||'').toLowerCase():c=='estrategia'?String(r.strategy||'').toLowerCase():c=='estado'?String(r.state||''):0;
+ return arr.slice().sort((a,b)=>{const x=val(a),y=val(b);return (x<y?-1:x>y?1:0)*d;});
+}
+function renderRankTable(){
+ const el=document.getElementById('rank-list');if(!el)return;
+ if(!RANKDATA.length){el.innerHTML='<span class="mut">aún no has lanzado clasificatorias reclamables. Lánzalas desde RUN → tarjeta 🏁.</span>';return;}
+ const rankBy={};RANKDATA.filter(r=>r.bb100!=null).slice().sort((a,b)=>b.bb100-a.bb100).forEach((r,i)=>{rankBy[r.label]=i+1;});
+ const a=sortRank(RANKDATA);
+ const ar=c=>RSORT.col==c?(RSORT.dir<0?' ▼':' ▲'):'';
+ const th=(c,l)=>'<th data-sort="'+c+'" style="cursor:pointer">'+l+ar(c)+'</th>';
+ el.innerHTML='<table class="htab"><thead><tr><th>#</th>'+th('nombre','nombre')+th('estrategia','estrategia')+th('manos','manos')+th('bb100','bb/100')+th('estado','estado')+th('fecha','fecha')+'<th></th></tr></thead><tbody>'+
+  a.map(r=>{const up=r.state=='active',done=r.bb100!=null;
+   return '<tr><td>'+(rankBy[r.label]||'·')+'</td><td><b>'+esc(r.name||r.label)+'</b> <span class="mut" style="font-size:10px">'+esc(r.label)+'</span></td><td>'+esc(r.strategy||'?')+'</td><td>'+(r.hands||0)+'</td><td>'+(r.bb100==null?'<span class="mut">jugando…</span>':'<b class="'+(r.bb100>=0?'posv':'neg')+'">'+(r.bb100>=0?'+':'')+r.bb100+'</b>')+'</td><td><span class="dot '+(up?'warn':(done?'up':'down'))+'"></span>'+(up?'jugando':(done?'terminado':esc(r.state)))+'</td><td class="mut" style="font-size:11px;white-space:nowrap">'+(r.ts?new Date(r.ts*1000).toLocaleString([],{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit",hour12:false}):"—")+'</td><td><button class="eqbtn" data-claim="'+esc(r.label)+'">🏆 reclamar</button></td></tr>';}).join('')+'</tbody></table>';
+}
+async function refreshRank(){
+ const el=document.getElementById('rank-list');if(!el)return;
+ try{const d=await (await fetch('/api/rank')).json();RANKDATA=d.agents||[];renderRankTable();
+ }catch(e){el.textContent='error';}
+}
+document.getElementById('rankbox').addEventListener('click',async e=>{
+ const th=e.target.closest('th[data-sort]');
+ if(th){const c=th.dataset.sort;if(RSORT.col==c)RSORT.dir*=-1;else{RSORT.col=c;RSORT.dir=(c=='bb100'||c=='fecha'||c=='manos')?-1:1;}renderRankTable();return;}
+ const cb=e.target.closest('[data-claim]');if(!cb)return;
+ const lab=cb.dataset.claim,m=document.getElementById('rank-msg');if(m)m.textContent='obteniendo enlace de claim…';
+ try{const d=await (await fetch('/api/claim?label='+encodeURIComponent(lab))).json();
+  if(m)m.innerHTML=d.claim_url?('🏆 <b>'+esc(lab)+'</b> — abre para reclamar y entrar en la clasificación con tu cuenta dev.fun: <a class="rlink" href="'+esc(d.claim_url)+'" target="_blank" rel="noopener">'+esc(d.claim_url)+'</a>'):('<span class="neg">'+esc(d.error||'sin claim_url')+'</span>');
+ }catch(_){if(m)m.textContent='error';}
+});
 </script></body></html>"""
 
 
@@ -1178,8 +1352,19 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/strats"):
             self._send(json.dumps(_strats(), default=str), "application/json")
             return
+        if p.startswith("/api/claim"):
+            from urllib.parse import urlparse, parse_qs
+            lab = parse_qs(urlparse(p).query).get("label", [""])[0]
+            self._send(json.dumps(_claim(lab), default=str), "application/json")
+            return
         if p.startswith("/api/runs"):
             self._send(json.dumps(_runs(), default=str), "application/json")
+            return
+        if p.startswith("/api/rank"):
+            self._send(json.dumps(_rank(), default=str), "application/json")
+            return
+        if p.startswith("/api/live"):
+            self._send(json.dumps(_live(), default=str), "application/json")
             return
         if p.startswith("/api/state"):
             self._send(json.dumps(state_cached(), default=str), "application/json")
@@ -1212,6 +1397,70 @@ class H(BaseHTTPRequestHandler):
             else:
                 reply({"error": "unit inválida"})
             return
+        if p.startswith("/api/run/clean"):
+            mode = str(body.get("mode", ""))
+            if mode not in ("failed", "completed", "stopall", "small"):
+                reply({"error": "mode inválido"}); return
+            units = []
+            try:
+                r = subprocess.run(["systemctl", "list-units", "--type=service", "--all", "--no-legend",
+                                    "--plain", "arena-run-*"], capture_output=True, text=True, timeout=6).stdout
+                for line in r.splitlines():
+                    parts = line.split()
+                    if parts and parts[0].startswith("arena-run-"):
+                        units.append((parts[0], parts[2] if len(parts) > 2 else ""))
+            except Exception as e:
+                reply({"error": str(e)}); return
+            if mode == "small":                    # borrar runs NO activas con < 50 manos (unidad + sus datos)
+                done, purged = 0, []
+                try:
+                    wc = sqlite3.connect(DB, timeout=10)
+                    wc.execute("PRAGMA busy_timeout=8000")
+                except Exception as e:
+                    reply({"error": "db: " + str(e)}); return
+                for u, active in units:
+                    if active in ("active", "activating"):
+                        continue
+                    label = u[len("arena-run-"):].replace(".service", "")
+                    try:
+                        h = wc.execute("select count(distinct hand_key) from decisions where run_label=?", (label,)).fetchone()[0]
+                    except Exception:
+                        h = 0
+                    if h >= 50:
+                        continue
+                    try:
+                        subprocess.run(["systemctl", "stop", u], timeout=10)
+                        subprocess.run(["systemctl", "reset-failed", u], timeout=5)
+                    except Exception:
+                        pass
+                    try:
+                        for _t in ("decisions", "equity", "runs"):
+                            wc.execute("delete from " + _t + " where run_label=?", (label,))
+                        wc.commit()
+                    except Exception:
+                        pass
+                    try:
+                        os.remove(os.path.join(HERE, ".clasif", label + ".json"))
+                    except Exception:
+                        pass
+                    purged.append(label); done += 1
+                wc.close()
+                reply({"ok": True, "mode": mode, "count": done, "labels": purged})
+                return
+            want = {"failed": ("failed",), "completed": ("inactive",), "stopall": ("active", "activating")}[mode]
+            done = 0
+            for u, active in units:
+                if active not in want:
+                    continue
+                try:
+                    subprocess.run(["systemctl", "stop", u], timeout=10)
+                    if mode != "stopall":
+                        subprocess.run(["systemctl", "reset-failed", u], timeout=5)
+                    done += 1
+                except Exception:
+                    pass
+            reply({"ok": True, "mode": mode, "count": done})
+            return
         if p.startswith("/api/run"):
             label = str(body.get("label", "")).strip().lower()
             ranges, engine = str(body.get("ranges", "std")), str(body.get("engine", "hybrid"))
@@ -1226,12 +1475,19 @@ class H(BaseHTTPRequestHandler):
                 reply({"error": "ranges/engine inválidos"}); return
             if strat and (not re.fullmatch(r"[a-z0-9_-]{1,24}", strat) or (s7_strat and strat not in s7_strat.names())):
                 reply({"error": "strat inválida o inexistente"}); return
+            name = str(body.get("name", "")).strip()
+            if name and not re.fullmatch(r"[A-Za-z0-9 ._-]{1,32}", name):
+                reply({"error": "nombre inválido (A-Z 0-9 espacio . _ - , máx 32)"}); return
             cmd = ["systemd-run", "--unit=arena-run-" + label, "--working-directory=" + HERE,
                    "--setenv=HOME=" + HERE, "--setenv=PATH=/usr/local/bin:/usr/bin:/bin",
                    "--setenv=PYTHONUNBUFFERED=1", "--setenv=S7_STATS_DB=" + DB,
                    "--setenv=S7_RUN_LABEL=" + label, "--setenv=S7_RANGES=" + ranges]
             if strat:
                 cmd.append("--setenv=S7_STRAT=" + strat)
+            if name:
+                cmd.append("--setenv=S7_AGENT_NAME=" + name)
+            if label.startswith("clasif"):        # clasificatoria → persist creds for the claim flow
+                cmd.append("--setenv=S7_SAVE_CREDS=1")
             try:
                 mt = int(body.get("max_tokens") or 0)
                 if mt > 0:

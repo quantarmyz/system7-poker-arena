@@ -1,0 +1,9 @@
+{
+  "base": "wide",
+  "knobs": {
+    "open_size_bb": 2.3,
+    "threebet_mult": 3.3,
+    "value_eq": 0.58,
+    "cbet_bluff_frac": 0.45
+  }
+}

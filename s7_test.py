@@ -185,9 +185,21 @@ def _capture_results(c, agent_id, players):
 
 def run_match(c, decide, engine, max_hands, label):
     h = f"s7t-{secrets.token_hex(4)}"
-    body = c.post("/auth/register", {"handle": h, "name": "S7 test", "quote": "bench", "description": ""})
+    body = c.post("/auth/register", {"handle": h, "name": os.environ.get("S7_AGENT_NAME") or "S7 test",
+                                      "quote": "bench", "description": ""})
     c.api_key = body.get("apiKey")
     agent_id = body.get("agentId") or body.get("id")
+    if os.environ.get("S7_SAVE_CREDS"):           # clasificatoria: persist creds so the agent can be claimed later
+        try:
+            _cd = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".clasif")
+            os.makedirs(_cd, exist_ok=True)
+            with open(os.path.join(_cd, label + ".json"), "w", encoding="utf-8") as _f:
+                json.dump({"handle": h, "name": os.environ.get("S7_AGENT_NAME") or "S7 test",
+                           "agentId": agent_id, "apiKey": c.api_key, "competition": EVAL,
+                           "strat": os.environ.get("S7_STRAT") or "std", "engine": engine,
+                           "ts": time.time()}, _f)
+        except Exception:
+            pass
     print(f"[s7-test] agent {h} ({agent_id})", flush=True)
     start = c.post("/texas/benchmark/start", {"competitionId": EVAL})
     m = (start or {}).get("match") or {}

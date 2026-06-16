@@ -1,0 +1,8 @@
+{
+  "base": "std",
+  "knobs": {
+    "station_mult": 1.5,
+    "value_eq": 0.58,
+    "cbet_bluff_frac": 0.20
+  }
+}
