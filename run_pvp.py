@@ -15,6 +15,7 @@ import sys
 import time
 import json
 import random
+import fcntl
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_HERE, "examples"))
@@ -28,17 +29,83 @@ import s7_reads                   # noqa: E402  HUD
 import s7_stats                   # noqa: E402  recorder
 from arena_client import ArenaClient, ArenaError, DEFAULT_BASE  # noqa: E402
 
-COMP = os.environ.get("ARENA_COMPETITION_ID") or "cmq57o53r0bhw18g23qkydb08"
+COMP = os.environ.get("ARENA_COMPETITION_ID") or ""   # resolved at runtime via list-active
 TARGET = int(os.environ.get("S7_TARGET_HANDS", "25000"))
 
 
 def _key():
-    with open(os.path.join(_HERE, ".arena-credentials")) as f:
-        return json.load(f)["apiKey"]
+    # S7_CREDS_FILE lets Docker/volumes provide creds (the image excludes .arena-credentials).
+    for p in (os.environ.get("S7_CREDS_FILE"),
+              os.path.join(_HERE, ".arena-credentials"),
+              "/data/.arena-credentials"):
+        if p and os.path.exists(p):
+            with open(p) as f:
+                return json.load(f)["apiKey"]
+    raise SystemExit("no creds: set S7_CREDS_FILE or provide .arena-credentials")
+
+
+_AID_CACHE = [None]
+
+
+def _agent_id():
+    """agentId de las creds (para /agent/{id}/replays → reproductor oficial); cacheado."""
+    if _AID_CACHE[0] is None:
+        _AID_CACHE[0] = ""
+        for p in (os.environ.get("S7_CREDS_FILE"), os.path.join(_HERE, ".arena-credentials"), "/data/.arena-credentials"):
+            if p and os.path.exists(p):
+                try:
+                    _AID_CACHE[0] = json.load(open(p)).get("agentId") or ""
+                except Exception:
+                    pass
+                break
+    return _AID_CACHE[0]
 
 
 def _log(*a):
     print("[s7-pvp]", *a, flush=True)
+
+
+def _single_instance_lock():
+    """Refuse to start a 2nd PvP loop (the 7-copies/429 thrash we saw). flock on
+    the shared /data volume coordinates even across separate containers."""
+    path = os.environ.get("S7_PVP_LOCK") or (
+        "/data/.pvp.lock" if os.path.isdir("/data") else os.path.join(_HERE, ".pvp.lock"))
+    f = open(path, "w")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        _log(f"another PvP instance holds {path}; exiting (single-instance).")
+        raise SystemExit(0)
+    f.write(str(os.getpid()))
+    f.flush()
+    return f
+
+
+def _resolve_comp(c):
+    """Discover the live competition the official way (GET /competition/list-active).
+    Honors ARENA_COMPETITION_ID when it's currently active; else picks the active
+    'Playground' (free cash). NEVER auto-selects a buy-in Tournament (paid)."""
+    forced = os.environ.get("ARENA_COMPETITION_ID") or ""
+    prefer = os.environ.get("S7_COMP_PREFER", "Playground").lower()
+    try:
+        r = c.get("/competition/list-active")
+        comps = r if isinstance(r, list) else (r.get("competitions") or r.get("data") or [])
+    except Exception as e:
+        _log(f"list-active failed ({e}); using ARENA_COMPETITION_ID={forced or '(none)'}")
+        return forced
+    poker = [x for x in comps if str(x.get("gameType")) == "TexasHoldem"]
+    by_id = {x.get("id"): x for x in poker}
+    if forced and forced in by_id:
+        _log(f"using forced competition {by_id[forced].get('name')} ({forced})")
+        return forced
+    nontourney = [x for x in poker if "tournament" not in str(x.get("name", "")).lower()]
+    pick = next((x for x in nontourney if prefer in str(x.get("name", "")).lower()), None) \
+        or (nontourney[0] if nontourney else None)
+    if pick:
+        _log(f"discovered competition {pick.get('name')} ({pick.get('id')})")
+        return pick.get("id")
+    _log(f"no free TexasHoldem competition active; live poker = {[x.get('name') for x in poker]}")
+    return forced
 
 
 def _deadline_s(table):
@@ -85,6 +152,7 @@ def _features(table, action, research):
         "action": act, "amount": action.get("amount"),
         "voluntary": int(street == "preflop" and act in ("call", "bet", "raise")),
         "preflop_raise": int(street == "preflop" and act in ("bet", "raise")),
+        "run_label": os.environ.get("S7_RUN_LABEL"),
     }
 
 
@@ -97,10 +165,18 @@ def _self_stack(table):
 
 
 def main():
+    _lock = _single_instance_lock()   # noqa: F841 — held for the process lifetime
     s7_stats.init()
     s7_stats.set_meta("started_at", time.time())
     s7_stats.set_meta("target_hands", TARGET)
     c = ArenaClient(os.environ.get("ARENA_API_BASE", DEFAULT_BASE), api_key=_key())
+
+    global COMP
+    COMP = _resolve_comp(c)
+    if not COMP:
+        _log("no active competition to join (set ARENA_COMPETITION_ID or wait). exiting.")
+        return
+    _log(f"strategy={os.environ.get('S7_STRAT') or 'std'} competition={COMP}")
 
     hands_done = 0
     rebuys = 0
@@ -125,7 +201,12 @@ def main():
                 _log(f"JOIN 402 entry fee (unexpected for Playground): {e.body} — stopping")
                 raise SystemExit(3)
             if e.status == 403:
-                _log(f"JOIN 403 (claim/verify required?): {e.body}")
+                try:
+                    cs = c.get("/auth/claim/status")
+                    _log("JOIN 403 — agent must be CLAIMED/verified via X. Open %s (token %s); "
+                         "after verifying it will auto-join." % (cs.get("claimUrl"), cs.get("claimToken")))
+                except Exception:
+                    _log(f"JOIN 403 (claim/verify required): {e.body}")
             elif e.status == 409:
                 pass  # already seated (1-table concurrency) — normal liveness check, not an error
             else:
@@ -228,6 +309,21 @@ def main():
         if time.time() - last_beat > 60:
             try:
                 s7_stats.log_bankroll(last_stack, hands_done, rebuys)
+                _rl = os.environ.get("S7_RUN_LABEL")
+                if _rl and last_stack is not None:
+                    _net = last_stack - 1000 * (1 + rebuys)         # neto vs bankroll inicial + rebuys
+                    s7_stats.log_equity(_rl, hands_done, _net, _net)
+                _aid = _agent_id()                                  # captura replay_url → reproductor oficial
+                if _aid:
+                    _rep = c.get(f"/agent/{_aid}/replays?limit=50")
+                    _rows = _rep if isinstance(_rep, list) else ((_rep or {}).get("data") or [])
+                    for _r in (_rows or []):
+                        _tid = _r.get("tableId") or _r.get("handId")
+                        _url = _r.get("replayUrl") or _r.get("url")
+                        if _tid and _url:
+                            _wh = _r.get("winnerHandle") or _r.get("winner")
+                            s7_stats.log_hand_result(str(_tid), "", ([{"agentName": _wh}] if _wh else []),
+                                                     [], 0, _r.get("chipDelta"), "", _url)
             except Exception:
                 pass
             _log(f"hands={hands_done}/{TARGET} rebuys={rebuys} lastStack={last_stack}")

@@ -17,6 +17,10 @@ reproducible A/B experiment.
 > (MIT). System 7 is the engine, instrumentation, dashboard and coach layered on the kit's
 > client/loop. See [Acknowledgements](#acknowledgements).
 
+> **The dashboard is a three-zone pipeline** — *LAB* (build + evaluate) → *COACH*
+> (diagnose + adjust) → *PRODUCTION* (deploy + monitor live play), with separate
+> cash/tournament contexts. Full walkthrough in **[docs/PIPELINE.md](docs/PIPELINE.md)**.
+
 ---
 
 ## Highlights

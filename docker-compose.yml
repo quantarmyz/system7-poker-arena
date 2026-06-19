@@ -10,8 +10,11 @@ x-common: &common
   restart: unless-stopped
   init: true                      # tini as PID 1 → reaps orphaned run subprocesses
   environment: &common-env
-    S7_STATS_DB: /data/s7_test.db
+    S7_STATS_DB: /data/s7_cash.db
+    S7_DB_CASH: /data/s7_cash.db
+    S7_DB_TOURNEY: /data/s7_tourney.db
     S7_STRAT_DIR: /data/strategies
+    S7_AGENTS_DIR: /data/agents
     S7_CLASIF_DIR: /data/.clasif
     S7_JOBS_DIR: /data/jobs
 
@@ -37,8 +40,13 @@ services:
       S7_ENGINE: hybrid
       S7_MATCHES: "50"
 
-  # Optional: PvP Playground loop (play-money; needs the Playground open).
+  # Optional: PvP Playground loop (play-money; needs the Playground open + creds in
+  # /data/.arena-pg-credentials from `POST /auth/register`). Plays the s7-opus strategy.
   pvp:
     <<: *common
     command: ["pvp"]
     profiles: ["pvp"]
+    environment:
+      <<: *common-env
+      S7_STRAT: s7-opus
+      S7_CREDS_FILE: /data/.arena-pg-credentials

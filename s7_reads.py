@@ -45,6 +45,15 @@ def _fetch(agent_id: str) -> Optional[dict]:
     hit = _CACHE.get(agent_id)
     if hit and now - hit[0] < _TTL:
         return hit[1]
+    if os.environ.get("S7_TRACKER", "1") != "0":   # preferir el perfil agregado del tracker
+        try:
+            import s7_stats
+            prof = s7_stats.get_opp_profile(agent_id)
+            if prof and (prof.get("N") or 0):
+                _CACHE[agent_id] = (now, prof)
+                return prof
+        except Exception:
+            pass
     stats = None
     try:
         comp = _COMP or os.environ.get("ARENA_COMPETITION_ID")

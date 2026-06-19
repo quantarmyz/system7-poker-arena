@@ -60,13 +60,14 @@ try:
 except Exception:
     s7_mllm = None
 import s7_jobs        # run backend: systemd on the LXC, plain subprocess in Docker (auto-detected)
+import s7_api         # nuevos endpoints del rediseño (LAB · PRODUCCIÓN · TRACKER)
 CLASIF_DIR = os.environ.get("S7_CLASIF_DIR", os.path.join(HERE, ".clasif"))
-_cache = {"ts": 0.0, "data": None}
+_cache = {}                       # state cache por game (cash/tournament)
 _lock = threading.Lock()
 
 
 def _ro():
-    return sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=5)
+    return sqlite3.connect(f"file:{s7_api._dbpath()}?mode=ro", uri=True, timeout=5)
 
 
 def _svc(name):
@@ -313,6 +314,10 @@ def _hands(limit=600):
         out.append({"key": k, "ts": h["ts"], "pos": h["pos"], "hole": h["hole"], "hclass": h["hclass"],
                     "board": h["board"], "label": h["label"], "reached": reached, "m3": h["m3"],
                     "pot": h["pot"], "n": len(h["acts"]), "moves": moves,
+                    "act_pf": ", ".join(_byst.get("preflop", [])), "act_flop": ", ".join(_byst.get("flop", [])),
+                    "act_turn": ", ".join(_byst.get("turn", [])), "act_river": ", ".join(_byst.get("river", [])),
+                    "fold": next((st for st in ("preflop", "flop", "turn", "river")
+                                  if any("fold" in (a or "") for a in _byst.get(st, []))), ""),
                     "spr_pf": h["sprst"].get("preflop"),
                     "spr_post": h["sprst"].get("flop") or h["sprst"].get("turn") or h["sprst"].get("river"),
                     "delta": dl, "winner": wn, "won": (dl is not None and dl > 0)})
@@ -530,6 +535,23 @@ def _validate_strat(cfg):
         ck["sizing"] = kn["sizing"]
     if ck:
         out["knobs"] = ck
+    if cfg.get("game") in ("cash", "tournament"):
+        out["game"] = cfg["game"]
+    if cfg.get("mode") in ("agr", "nit", "std"):
+        out["mode"] = cfg["mode"]
+    if isinstance(cfg.get("bb_buckets"), list) and len(cfg["bb_buckets"]) == 3:
+        try:
+            out["bb_buckets"] = [int(x) for x in cfg["bb_buckets"]]
+        except Exception:
+            pass
+    if isinstance(cfg.get("tournament_ranges"), dict):
+        tr = {}
+        for b, pm in cfg["tournament_ranges"].items():
+            if b in ("deep", "mid", "short", "push") and isinstance(pm, dict):
+                tr[b] = {str(p).upper(): [str(t) for t in toks][:169] for p, toks in pm.items()
+                         if str(p).upper() in ("UTG", "MP", "CO", "BTN", "SB", "BB") and isinstance(toks, list)}
+        if tr:
+            out["tournament_ranges"] = tr
     return out or None
 
 
@@ -539,7 +561,7 @@ def _coach_compute(hands, window=None):
         import sys as _sys
         _sys.path.insert(0, os.path.join(HERE, "examples"))
         _sys.path.insert(0, HERE)
-        os.environ.setdefault("S7_STATS_DB", DB)
+        os.environ["S7_STATS_DB"] = s7_api._dbpath(_coach_cache.get("game"))
         import s7_report
         import llm_system7
         rep = s7_report.report()
@@ -616,6 +638,7 @@ def _coach_llm(window=None):
         return {"error": c["err"]}
     c["running"] = True
     c["window"] = window
+    c["game"] = s7_api.curgame()
     threading.Thread(target=_coach_compute, args=(hands, window), daemon=True).start()
     return {"running": True, "hands": hands, "started": True}
 
@@ -628,7 +651,9 @@ def _expand_cfg(cfg):
     _sys.path.insert(0, HERE)
     import decide_system7 as _D
     base = (cfg or {}).get("base")
-    src = _D.OPENING_RANGES_WIDE if base == "wide" else _D.OPENING_RANGES_STD
+    mode = (cfg or {}).get("mode")
+    _cash = {"agr": _D.OPENING_RANGES_AGR, "nit": _D.OPENING_RANGES_NIT, "std": _D.OPENING_RANGES_STD}
+    src = _cash.get(mode) or (_D.OPENING_RANGES_WIDE if base == "wide" else _D.OPENING_RANGES_STD)
     cr = (cfg or {}).get("opening_ranges") or {}
     ranges = {}
     for pos in _POS6:
@@ -642,6 +667,48 @@ def _expand_cfg(cfg):
             combos = set(src.get(pos, set()))
         ranges[pos] = sorted(combos)
     return ranges
+
+
+def _expand_tourn(cfg):
+    """Expand tournament ranges per BB-bucket (defaults + tournament_ranges override) for the builder."""
+    import sys as _sys
+    _sys.path.insert(0, HERE)
+    import decide_system7 as _D
+    ov = (cfg or {}).get("tournament_ranges") or {}
+    out = {}
+    for b in ("deep", "mid", "short", "push"):
+        bd = _D.TOURN_RANGES_DEFAULT.get(b, {})
+        bov = ov.get(b) or {}
+        ranges = {}
+        for pos in _POS6:
+            toks = bov.get(pos)
+            if isinstance(toks, list):
+                try:
+                    combos = _D._expand([str(t) for t in toks])
+                except Exception:
+                    combos = set(bd.get(pos, set()))
+            else:
+                combos = set(bd.get(pos, set()))
+            ranges[pos] = sorted(combos)
+        out[b] = ranges
+    return out
+
+
+def _sizing_template(cfg):
+    """Sizing matrix (texture×street bet fraction): engine default + knobs.sizing override."""
+    import decide_system7 as _D
+    siz = {t: dict(v) for t, v in _D.SIZING.items()}
+    ov = ((cfg or {}).get("knobs") or {}).get("sizing")
+    if isinstance(ov, dict):
+        for t, sm in ov.items():
+            if t in siz and isinstance(sm, dict):
+                for s in sm:
+                    if s in siz[t]:
+                        try:
+                            siz[t][s] = float(sm[s])
+                        except Exception:
+                            pass
+    return siz
 
 
 def _expand_classes(tokens):
@@ -667,7 +734,7 @@ def _expand_classes(tokens):
     return sorted(out)
 
 
-def _strat_template(base="std", name=""):
+def _strat_template(base="std", name="", mode="", game=""):
     """Seed the builder: full expanded ranges + knobs + 3bet for a fresh base (std/wide)
     or an existing saved strategy (loaded + expanded) so the user can edit it visually."""
     cfg = {}
@@ -678,10 +745,18 @@ def _strat_template(base="std", name=""):
         base = "std"
     if not cfg:
         cfg = {"base": base}
+    if mode in ("agr", "nit", "std"):
+        cfg["mode"] = mode
+    if game in ("cash", "tournament"):
+        cfg["game"] = game
     knobs = dict(KN_DEFAULTS)
     knobs.update({k: v for k, v in (cfg.get("knobs") or {}).items()
                   if k in KN_DEFAULTS and isinstance(v, (int, float))})
-    return {"name": name or "", "base": base, "ranges": _expand_cfg(cfg),
+    return {"name": name or "", "base": base,
+            "game": cfg.get("game") if cfg.get("game") in ("cash", "tournament") else "cash",
+            "mode": cfg.get("mode") if cfg.get("mode") in ("agr", "nit", "std") else "std",
+            "bb_buckets": cfg.get("bb_buckets") if (isinstance(cfg.get("bb_buckets"), list) and len(cfg.get("bb_buckets")) == 3) else [40, 20, 10],
+            "ranges": _expand_cfg(cfg), "tournament_ranges": _expand_tourn(cfg), "sizing": _sizing_template(cfg),
             "threebet_value": _expand_classes(cfg.get("threebet_value") or _DEF_3BV),
             "threebet_bluff": _expand_classes(cfg.get("threebet_bluff") or _DEF_3BB),
             "knobs": knobs, "knob_limits": {k: list(v) for k, v in KN_LIMITS.items()}}
@@ -699,6 +774,12 @@ def _save_strat(body):
         return {"error": "s7_strat no disponible"}
     base = body.get("base") if body.get("base") in ("std", "wide") else "std"
     cfg = {"base": base}
+    cfg["game"] = body.get("game") if body.get("game") in ("cash", "tournament") else "cash"
+    cfg["mode"] = body.get("mode") if body.get("mode") in ("agr", "nit", "std") else "std"
+    if isinstance(body.get("bb_buckets"), list):
+        cfg["bb_buckets"] = body["bb_buckets"]
+    if isinstance(body.get("tournament_ranges"), dict):
+        cfg["tournament_ranges"] = body["tournament_ranges"]
     orr = body.get("opening_ranges")
     if isinstance(orr, dict):
         cfg["opening_ranges"] = {p: v for p, v in orr.items() if isinstance(v, list)}
@@ -709,6 +790,8 @@ def _save_strat(body):
         cfg["knobs"] = body["knobs"]
     clean = _validate_strat(cfg) or {}
     clean["base"] = base
+    clean["game"] = cfg["game"]
+    clean["mode"] = cfg["mode"]
     try:
         s7_strat.save(name, clean)
     except Exception as e:
@@ -725,7 +808,7 @@ def _stratgen_compute(window, mode):
         import sys as _sys
         _sys.path.insert(0, os.path.join(HERE, "examples"))
         _sys.path.insert(0, HERE)
-        os.environ.setdefault("S7_STATS_DB", DB)
+        os.environ["S7_STATS_DB"] = s7_api._dbpath(_stratgen_cache.get("game"))
         import llm_system7
         persona = (
             "Eres un jugador profesional de NLHE 6-max online, ganador, con millones de manos jugadas al año y "
@@ -810,7 +893,7 @@ def _stratgen_llm(window=None, mode="leaks"):
         return dict(c["data"], cached=True)
     if c.get("err") and time.time() - c["ts"] < 30:
         return {"error": c["err"]}
-    c.update(running=True, window=window, mode=mode)
+    c.update(running=True, window=window, mode=mode, game=s7_api.curgame())
     threading.Thread(target=_stratgen_compute, args=(window, mode), daemon=True).start()
     return {"running": True, "started": True}
 
@@ -868,11 +951,26 @@ def _claim(label):
     """Fetch the dev.fun claim URL for a saved clasificatoria agent (links it to the user's account)."""
     if not re.fullmatch(r"[a-z0-9_-]{1,24}", label or ""):
         return {"error": "label inválida"}
+    creds = None
     try:
         with open(os.path.join(CLASIF_DIR, label + ".json"), encoding="utf-8") as f:
             creds = json.load(f)
     except Exception:
-        return {"error": "sin credenciales guardadas para '" + str(label) + "' (sólo las clasificatorias lanzadas con la tarjeta tras esta versión son reclamables)"}
+        creds = None
+    if creds is None:                       # agente PvP (Playground/torneo): juega con la identidad compartida
+        try:
+            dep = s7_api._jload(s7_api._DEPLOYS_PATH, {}).get(label, {})
+        except Exception:
+            dep = {}
+        comp = str(dep.get("competition") or "")
+        if dep and comp not in ("eval", "seed_poker_eval_s1", ""):
+            try:
+                with open(os.path.join(s7_api._DATA, ".arena-pg-credentials"), encoding="utf-8") as f:
+                    creds = json.load(f)
+            except Exception:
+                creds = None
+    if creds is None:
+        return {"error": "sin credenciales para '" + str(label) + "'"}
     try:
         import urllib.request
         req = urllib.request.Request("https://arena.dev.fun/api/arena/auth/claim/status",
@@ -991,7 +1089,8 @@ def _mllm_results(run):
 
 
 def _rank():
-    """My launched clasificatoria agents, ranked by Eval bb/100 (for choosing which to claim)."""
+    """Agentes lanzados, etiquetados por tipo: Eval (cred reclamable en .clasif) + deploys PvP
+    (Playground/Torneo, de prod_deploys). Así no se confunde un resultado de Eval con juego PvP."""
     prog, hands = {}, {}
     try:
         c = _ro()
@@ -1002,24 +1101,36 @@ def _rank():
         c.close()
     except Exception:
         pass
-    rows = []
+    creds = {}
     try:
         for fn in sorted(os.listdir(CLASIF_DIR)):
-            if not fn.endswith(".json"):
-                continue
-            lbl = fn[:-5]
-            try:
-                with open(os.path.join(CLASIF_DIR, fn), encoding="utf-8") as f:
-                    cr = json.load(f)
-            except Exception:
-                cr = {}
-            strat = cr.get("strat") or (lbl.split("-")[1] if len(lbl.split("-")) >= 2 else "?")
-            rows.append({"label": lbl, "name": cr.get("name") or lbl, "agentId": cr.get("agentId"),
-                         "strategy": strat, "engine": cr.get("engine"), "hands": hands.get(lbl, 0),
-                         "bb100": prog.get(lbl), "state": _svc("arena-run-" + lbl), "ts": cr.get("ts")})
+            if fn.endswith(".json"):
+                try:
+                    with open(os.path.join(CLASIF_DIR, fn), encoding="utf-8") as f:
+                        creds[fn[:-5]] = json.load(f)
+                except Exception:
+                    creds[fn[:-5]] = {}
     except Exception:
         pass
-    rows.sort(key=lambda r: (r["bb100"] is None, -(r["bb100"] if r["bb100"] is not None else -1e9)))
+    try:
+        deploys = s7_api._jload(s7_api._DEPLOYS_PATH, {})
+    except Exception:
+        deploys = {}
+    _names = {"cmqf827h30u7dfca3x2aqvzjv": "Playground", "cmqggiv9k37am11ydmppz466e": "Torneo"}
+    rows = []
+    for lbl in set(creds) | set(deploys):
+        cr = creds.get(lbl, {})
+        dp = deploys.get(lbl, {})
+        comp = str(cr.get("competition") or dp.get("competition") or "")
+        is_eval = comp == "seed_poker_eval_s1" or "eval" in comp.lower()
+        rows.append({"label": lbl, "name": dp.get("agent") or cr.get("name") or lbl,
+                     "agentId": cr.get("agentId"), "strategy": cr.get("strat") or dp.get("agent") or "?",
+                     "engine": cr.get("engine") or "", "hands": hands.get(lbl, 0), "bb100": prog.get(lbl),
+                     "kind": "eval" if is_eval else "pvp",
+                     "type": "Eval" if is_eval else _names.get(comp, dp.get("compname") or "PvP"),
+                     "claimable": (lbl in creds) or (not is_eval and bool(dp)), "ts": cr.get("ts") or dp.get("ts")})
+    rows.sort(key=lambda r: (r["kind"] != "eval", r["bb100"] is None,
+                             -(r["bb100"] if r["bb100"] is not None else -1e9)))
     return {"agents": rows}
 
 
@@ -1037,11 +1148,13 @@ def _live():
 
 
 def state_cached():
+    g = s7_api.curgame()
     with _lock:
-        if time.time() - _cache["ts"] > 2 or _cache["data"] is None:
-            _cache["data"] = _state()
-            _cache["ts"] = time.time()
-        return _cache["data"]
+        ent = _cache.get(g)
+        if not ent or time.time() - ent["ts"] > 2:
+            ent = {"data": _state(), "ts": time.time()}
+            _cache[g] = ent
+        return ent["data"]
 
 
 HTML = r"""<!doctype html><html lang="es"><head><meta charset="utf-8">
@@ -1911,12 +2024,75 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    _CT = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
+           ".js": "application/javascript; charset=utf-8", ".json": "application/json",
+           ".svg": "image/svg+xml", ".ico": "image/x-icon", ".woff2": "font/woff2", ".png": "image/png"}
+
+    def _serve_static(self, urlpath):
+        """Serve web/ static files (the new 3-zone frontend). Path-traversal safe."""
+        rel = urlpath.split("?", 1)[0].lstrip("/")
+        base = os.path.join(HERE, "web")
+        full = os.path.normpath(os.path.join(HERE, rel))
+        if full != base and not full.startswith(base + os.sep):
+            self.send_response(403); self.end_headers(); return
+        if not os.path.isfile(full):
+            self.send_response(404); self.end_headers(); return
+        try:
+            with open(full, "rb") as f:
+                body = f.read()
+        except Exception:
+            self.send_response(500); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Content-Type", self._CT.get(os.path.splitext(full)[1].lower(), "application/octet-stream"))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self):
         p = self.path
+        from urllib.parse import urlparse as _up, parse_qs as _pq
+        s7_api.set_game(_pq(_up(p).query).get("game", ["cash"])[0])
         if p == "/favicon.ico":
             self.send_response(204)
             self.send_header("Cache-Control", "max-age=86400")
             self.end_headers()
+            return
+        if p.startswith("/api/agents"):
+            self._send(json.dumps(s7_api.agents_list(), default=str), "application/json")
+            return
+        if p.startswith("/api/lab/groups"):
+            self._send(json.dumps(s7_api.lab_groups(), default=str), "application/json")
+            return
+        if p.startswith("/api/lab/task"):
+            from urllib.parse import urlparse, parse_qs
+            ag = parse_qs(urlparse(p).query).get("agent", [""])[0]
+            self._send(json.dumps(s7_api.lab_task(ag), default=str), "application/json")
+            return
+        if p.startswith("/api/lab/report"):
+            from urllib.parse import urlparse, parse_qs
+            ag = parse_qs(urlparse(p).query).get("agent", [""])[0]
+            self._send(json.dumps(s7_api.lab_report(ag), default=str), "application/json")
+            return
+        if p.startswith("/api/production/competitions"):
+            self._send(json.dumps(s7_api.production_competitions(), default=str), "application/json")
+            return
+        if p.startswith("/api/production/account"):
+            self._send(json.dumps(s7_api.production_account(), default=str), "application/json")
+            return
+        if p.startswith("/api/production/session"):
+            from urllib.parse import urlparse, parse_qs
+            lb = parse_qs(urlparse(p).query).get("label", [""])[0]
+            self._send(json.dumps(s7_api.production_session(lb), default=str), "application/json")
+            return
+        if p.startswith("/api/production/status"):
+            self._send(json.dumps(s7_api.production_status(), default=str), "application/json")
+            return
+        if p.startswith("/api/tracker/opponents"):
+            self._send(json.dumps(s7_api.tracker_opponents(), default=str), "application/json")
+            return
+        if p.startswith("/api/tracker/own"):
+            self._send(json.dumps(s7_api.tracker_own(), default=str), "application/json")
             return
         if p.startswith("/api/players"):
             self._send(json.dumps(_players(), default=str), "application/json")
@@ -1967,7 +2143,9 @@ class H(BaseHTTPRequestHandler):
             qs = parse_qs(urlparse(p).query)
             base = qs.get("base", ["std"])[0]
             name = qs.get("name", [""])[0]
-            self._send(json.dumps(_strat_template(base, name), default=str), "application/json")
+            mode = qs.get("mode", [""])[0]
+            gametype = qs.get("gametype", [""])[0]
+            self._send(json.dumps(_strat_template(base, name, mode, gametype), default=str), "application/json")
             return
         if p.startswith("/api/strats"):
             self._send(json.dumps(_strats(), default=str), "application/json")
@@ -2000,8 +2178,11 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/state"):
             self._send(json.dumps(state_cached(), default=str), "application/json")
             return
+        if p.startswith("/web/"):
+            self._serve_static(p)
+            return
         if p == "/" or p.startswith("/index"):
-            self._send(HTML, "text/html; charset=utf-8")
+            self._serve_static("/web/index.html")
             return
         self.send_response(404)
         self.end_headers()
@@ -2013,10 +2194,29 @@ class H(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(ln) or "{}") if ln else {}
         except Exception:
             body = {}
+        s7_api.set_game(body.get("game", "cash"))
 
         def reply(o):
             self._send(json.dumps(o), "application/json")
 
+        if p.startswith("/api/agent/save"):
+            reply(s7_api.save_agent(body)); return
+        if p.startswith("/api/agent/delete"):
+            reply(s7_api.delete_agent(body.get("name"))); return
+        if p.startswith("/api/rank/delete"):
+            reply(s7_api.rank_delete(body)); return
+        if p.startswith("/api/lab/stop"):
+            reply(s7_api.lab_stop(body)); return
+        if p.startswith("/api/lab/eval"):
+            reply(s7_api.lab_eval(body)); return
+        if p.startswith("/api/production/queue-remove"):
+            reply(s7_api.production_queue_remove(body)); return
+        if p.startswith("/api/production/deploy"):
+            reply(s7_api.production_deploy(body)); return
+        if p.startswith("/api/production/stop"):
+            reply(s7_api.production_stop(body)); return
+        if p.startswith("/api/tracker/harvest"):
+            reply(s7_api.tracker_harvest()); return
         if p.startswith("/api/strats/save"):
             reply(_save_strat(body))
             return
@@ -2039,7 +2239,7 @@ class H(BaseHTTPRequestHandler):
             if mode == "small":                    # borrar runs NO activas con < 50 manos (job + sus datos)
                 done, purged = 0, []
                 try:
-                    wc = sqlite3.connect(DB, timeout=10)
+                    wc = sqlite3.connect(s7_api._dbpath(), timeout=10)
                     wc.execute("PRAGMA busy_timeout=8000")
                 except Exception as e:
                     reply({"error": "db: " + str(e)}); return
@@ -2181,4 +2381,5 @@ class H(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     print(f"[s7-dash] serving http://0.0.0.0:{PORT}  db={DB}", flush=True)
+    threading.Thread(target=s7_api.queue_loop, daemon=True).start()   # procesa la cola de producción (1 a la vez)
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

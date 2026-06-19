@@ -213,10 +213,19 @@ def run_match(c, decide, engine, max_hands, label):
     last_eq = 0
     last_rt = 0.0
     players = {}
+    _t0 = time.time()
+    _timeout = float(os.environ.get("S7_MATCH_TIMEOUT", "4500"))   # wall-clock cap (75 min)
+    _poll = max(0.3, float(os.environ.get("S7_POLL_INTERVAL", "1.0")))   # intervalo de sondeo en vacío (s); más bajo = reacciona antes a tu turno
     while True:
+        if time.time() - _t0 > _timeout:
+            print(f"[s7-test] match TIMEOUT {int(time.time()-_t0)}s hands={completed}", flush=True)
+            s7_stats.log_run(label, agent_id, engine, completed, bb, None, None, m3, note="timeout")
+            return bb
         try:
             pend = c.get(f"/texas/pending-actions?competitionId={EVAL}")
         except ArenaError as e:
+            if e.status != 429:
+                print(f"[s7-test] poll error {e.status}", flush=True)
             time.sleep(2 if e.status == 429 else 1)
             pend = None
         tables = [t for t in ((pend or {}).get("tables") or []) if isinstance(t, dict) and t.get("tableId")]
@@ -300,7 +309,7 @@ def run_match(c, decide, engine, max_hands, label):
                 _CUM["adj"] += adj_cd
                 return bb
         if not tables:
-            time.sleep(1.0 + random.uniform(0, 0.4))
+            time.sleep(_poll + random.uniform(0, 0.3))
 
 
 def main():
@@ -329,7 +338,8 @@ def main():
         try:
             results.append(run_match(c, decide, a.engine, a.max_hands, label))
         except Exception as e:
-            print("[s7-test] match error:", e, flush=True)
+            import traceback
+            print("[s7-test] match ERROR:", e, "\n" + traceback.format_exc(), flush=True)
     c.close()
     ok = [r for r in results if isinstance(r, (int, float))]
     if ok:

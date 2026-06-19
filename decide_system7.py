@@ -94,22 +94,77 @@ OPENING_RANGES_WIDE = {
     "BB":  _expand(["22+", "A2s+", "A8o+", "K8s+", "KTo+", "Q8s+", "QTo+", "J8s+", "JTo",
                     "T8s+", "97s+", "86s+", "75s+", "65s", "54s", "KQo", "KJo", "QJo"]),
 }
+
+# Cash NIT (tight ~14/12) and AGR (= wide). With STD (medio) → las 3 modalidades cash.
+OPENING_RANGES_NIT = {
+    "UTG": _expand(["88+", "AJs+", "KQs", "AKo"]),
+    "MP":  _expand(["77+", "ATs+", "KJs+", "QJs", "AQo+"]),
+    "CO":  _expand(["66+", "A9s+", "A5s", "KTs+", "QTs+", "JTs", "T9s", "AJo+", "KQo"]),
+    "BTN": _expand(["22+", "A2s+", "K9s+", "Q9s+", "J9s+", "T9s", "98s", "ATo+", "KJo+", "QJo"]),
+    "SB":  _expand(["66+", "A9s+", "A5s", "KTs+", "QTs+", "JTs", "AJo+", "KQo"]),
+    "BB":  _expand(["88+", "AJs+", "KQs", "AKo"]),
+}
+OPENING_RANGES_AGR = OPENING_RANGES_WIDE   # cash agresivo = wide
+
+# Rangos de TORNEO por profundidad de stack (BBs efectivas). El tramo más corto = push/fold.
+TOURN_RANGES_DEFAULT = {
+    "deep": OPENING_RANGES_STD,                        # >40bb: juego completo
+    "mid": {                                           # 20-40bb: más tight, raise-fold
+        "UTG": _expand(["77+", "ATs+", "KQs", "AQo+"]),
+        "MP":  _expand(["66+", "A9s+", "KJs+", "QJs", "AJo+", "KQo"]),
+        "CO":  _expand(["44+", "A7s+", "A5s", "KTs+", "QTs+", "JTs", "ATo+", "KJo+"]),
+        "BTN": _expand(["22+", "A2s+", "K8s+", "Q9s+", "J9s+", "T8s+", "98s", "A9o+", "KTo+", "QJo"]),
+        "SB":  _expand(["22+", "A2s+", "K9s+", "Q9s+", "J9s+", "T9s", "A9o+", "KTo+"]),
+        "BB":  _expand(["66+", "A9s+", "KJs+", "QJs", "AJo+", "KQo"]),
+    },
+    "short": {                                         # 10-20bb: raise-or-fold tight
+        "UTG": _expand(["88+", "AJs+", "AQo+"]),
+        "MP":  _expand(["77+", "ATs+", "KQs", "AQo+"]),
+        "CO":  _expand(["66+", "A9s+", "KTs+", "QJs", "AJo+", "KQo"]),
+        "BTN": _expand(["44+", "A5s+", "K9s+", "QTs+", "JTs", "ATo+", "KJo+"]),
+        "SB":  _expand(["44+", "A7s+", "K9s+", "QTs+", "JTs", "ATo+", "KQo"]),
+        "BB":  _expand(["77+", "ATs+", "KQs", "AQo+"]),
+    },
+    "push": {                                          # <10bb: SHOVE/fold (rango de all-in)
+        "UTG": _expand(["66+", "A9s+", "ATo+", "KQs"]),
+        "MP":  _expand(["55+", "A8s+", "A9o+", "KJs+", "KQo"]),
+        "CO":  _expand(["44+", "A5s+", "A8o+", "K9s+", "KJo+", "QJs"]),
+        "BTN": _expand(["22+", "A2s+", "K7s+", "K9o+", "Q9s+", "QJo", "J9s+", "T9s"]),
+        "SB":  _expand(["22+", "A2s+", "K8s+", "KTo+", "Q9s+", "QJo", "J9s+", "T9s"]),
+        "BB":  _expand(["44+", "A5s+", "A8o+", "K9s+", "KJo+", "QJs"]),
+    },
+}
+
 try:
     import s7_strat
     _CFG = s7_strat.load()
 except Exception:
     _CFG = {}
-if _CFG.get("opening_ranges"):
-    OPENING_RANGES = dict(OPENING_RANGES_WIDE if _CFG.get("base") == "wide" else OPENING_RANGES_STD)
-    for _p, _t in _CFG["opening_ranges"].items():
-        try:
-            OPENING_RANGES[str(_p).upper()] = _expand(_t)
-        except Exception:
-            pass
-elif _CFG.get("base") == "wide" or os.environ.get("S7_RANGES") == "wide":
-    OPENING_RANGES = OPENING_RANGES_WIDE
-else:
-    OPENING_RANGES = OPENING_RANGES_STD
+
+# Tipo de juego + modalidad. base=wide → cash agr (retrocompat). S7_GAME/S7_RANGES override por entorno.
+GAME = str(_CFG.get("game") or os.environ.get("S7_GAME") or "cash").lower()
+MODE = str(_CFG.get("mode") or ("agr" if (_CFG.get("base") == "wide" or os.environ.get("S7_RANGES") == "wide") else "std")).lower()
+_bbk = _CFG.get("bb_buckets")
+BB_BUCKETS = _bbk if (isinstance(_bbk, list) and len(_bbk) == 3) else [40, 20, 10]
+_CASH_SETS = {"agr": OPENING_RANGES_AGR, "nit": OPENING_RANGES_NIT, "std": OPENING_RANGES_STD}
+
+
+def _apply_overrides(base_dict, override):
+    d = {k: set(v) for k, v in base_dict.items()}
+    if isinstance(override, dict):
+        for _p, _t in override.items():
+            try:
+                d[str(_p).upper()] = _expand(_t)
+            except Exception:
+                pass
+    return d
+
+
+# Rango cash activo (modalidad + override opening_ranges) + rangos de torneo por tramo.
+OPENING_RANGES = _apply_overrides(_CASH_SETS.get(MODE, OPENING_RANGES_STD), _CFG.get("opening_ranges"))
+_TOURN = {b: _apply_overrides(TOURN_RANGES_DEFAULT.get(b, OPENING_RANGES_STD),
+                              (_CFG.get("tournament_ranges") or {}).get(b))
+          for b in ("deep", "mid", "short", "push")}
 # Polarised 3-bet bluffs: weak suited-ace blockers (Directiva: A2s-A5s).
 _3BET_BLUFF_BLOCKERS = set(_CFG.get("threebet_bluff") or ["A2s", "A3s", "A4s", "A5s", "K9s", "Q9s"])
 _3BET_VALUE = set(_CFG.get("threebet_value") or ["AA", "KK", "QQ", "JJ", "AKs", "AKo", "AQs"])
@@ -377,6 +432,35 @@ def _position(table: dict):
     return (names[off] if off < len(names) else "BTN", off == n - 1, True)
 
 
+# ── game type / stack-depth range selection (cash modalities vs tournament BBs) ──
+def _eff_bb(table: dict) -> float:
+    bb = int(table.get("bigBlindChips") or 0) or 1
+    try:
+        return _eff_stack(table) / bb
+    except Exception:
+        return 100.0
+
+
+def _tourn_bucket(eff_bb: float) -> str:
+    hi, mid, lo = BB_BUCKETS
+    if eff_bb > hi:
+        return "deep"
+    if eff_bb > mid:
+        return "mid"
+    if eff_bb > lo:
+        return "short"
+    return "push"
+
+
+def _active_ranges(table: dict):
+    """Return (opening_ranges_dict, bucket). Cash → fixed modality; tournament → by eff BBs.
+    bucket=='push' (tournament short) switches preflop to shove/fold."""
+    if GAME == "tournament":
+        b = _tourn_bucket(_eff_bb(table))
+        return _TOURN.get(b, OPENING_RANGES), b
+    return OPENING_RANGES, "cash"
+
+
 # ── HUD / archetype (Directiva 1) ───────────────────────────────────────────────
 def _pct(x) -> float:
     """agent-stats ships rates as fractions (0.216 = 21.6%). Normalize to %.
@@ -515,7 +599,25 @@ def decide(table: dict, deadline_s: float = 10.0,
 
     # ── PREFLOP ──────────────────────────────────────────────────────────────
     if not board:
-        in_open = cls in OPENING_RANGES.get(pos, set())
+        ranges, _bkt = _active_ranges(table)
+        if _bkt == "push":            # torneo corto (<Xbb): shove/fold
+            in_range = cls in ranges.get(pos, set())
+            if call_chips == 0:
+                if in_range and allowed.get("canAllIn"):
+                    return _act("all-in", int(allowed.get("allInToAmount") or 0), allowed,
+                                f"shove {cls} {pos} (<{BB_BUCKETS[2]}bb)", FALLBACK_REASONING)
+                if "check" in avail:
+                    return _act("check", None, allowed, "check BB short", FALLBACK_REASONING)
+                return _act("fold", None, allowed, f"fold {cls} short", FALLBACK_REASONING)
+            if in_range and allowed.get("canAllIn"):
+                return _act("all-in", int(allowed.get("allInToAmount") or 0), allowed,
+                            f"re-shove {cls}", FALLBACK_REASONING)
+            if in_range and "call" in avail and call_chips <= _eff_stack(table):
+                return _act("call", None, allowed, f"call shove {cls}", FALLBACK_REASONING)
+            if "check" in avail:
+                return _act("check", None, allowed, "check short", FALLBACK_REASONING)
+            return _act("fold", None, allowed, f"fold {cls} short", FALLBACK_REASONING)
+        in_open = cls in ranges.get(pos, set())
         if call_chips == 0:  # unopened pot or in BB
             if in_open and ("raise" in avail or "bet" in avail):
                 act = "raise" if "raise" in avail else "bet"
@@ -545,7 +647,7 @@ def decide(table: dict, deadline_s: float = 10.0,
                 amt = _clamp(round(3 * bb), rng, call_chips * 2, pot + 4 * bb)
                 return _act("raise", amt, allowed, f"open/iso {cls} {pos}",
                             f'{{vr: "exploit", ke: "{cls} open", bf: [pf], pp: "{pos}", sr: "3bb"}}')
-            complete = (OPENING_RANGES.get("CO", set()) | OPENING_RANGES.get("BB", set())
+            complete = (ranges.get("CO", set()) | ranges.get("BB", set())
                         | {"A9o", "KTo", "QTo", "J9s", "T8s", "97s", "86s", "75s", "65s", "54s"})
             if pos in ("SB", "BB") and cls in complete and "call" in avail:
                 return _act("call", None, allowed, f"complete {cls} {pos}", FALLBACK_REASONING)
@@ -553,11 +655,11 @@ def decide(table: dict, deadline_s: float = 10.0,
                 return _act("check", None, allowed, "check option", FALLBACK_REASONING)
             return _act("fold", None, allowed, f"fold {cls} unraised", FALLBACK_REASONING)
         # facing a real raise — position-aware defend / fold
-        defend = (OPENING_RANGES.get(pos if pos in ("BB", "SB") else "BB", set())
+        defend = (ranges.get(pos if pos in ("BB", "SB") else "BB", set())
                   | {"99", "88", "77", "AJo", "ATs", "KQo", "KQs", "KJs", "QJs", "JTs"})
         cheap = call_chips <= 3 * bb
         if ((not station and cls in defend and cheap) or
-                (station and cls in (defend | OPENING_RANGES.get("CO", set())))) and "call" in avail:
+                (station and cls in (defend | ranges.get("CO", set())))) and "call" in avail:
             return _act("call", None, allowed, f"defend {cls} vs raise ({arc})", FALLBACK_REASONING)
         if "check" in avail:
             return _act("check", None, allowed, "check vs raise", FALLBACK_REASONING)

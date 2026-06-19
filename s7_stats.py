@@ -25,6 +25,11 @@ def _conn():
     c = sqlite3.connect(DB, timeout=60)
     c.execute("PRAGMA journal_mode=WAL")
     c.execute("PRAGMA synchronous=NORMAL")
+    # Bound WAL growth: shrink the -wal after checkpoints + checkpoint more often.
+    # Without this the WAL grew unbounded (the 10 GB incident) whenever long-lived
+    # readers pinned old snapshots.
+    c.execute("PRAGMA wal_autocheckpoint=2000")
+    c.execute("PRAGMA journal_size_limit=67108864")
     return c
 
 
@@ -74,6 +79,21 @@ def init():
             prompt_tokens INTEGER, completion_tokens INTEGER, answer TEXT, reasoning TEXT,
             think TEXT, judge_score REAL, judge_note TEXT, m3_action TEXT, ts REAL)""")
         c.execute("CREATE INDEX IF NOT EXISTS idx_mllm_res_run ON mllm_results(run_id)")
+        # ── PokerTracker/HM engine (s7_tracker) ──────────────────────────────
+        c.execute("""CREATE TABLE IF NOT EXISTS own_hands(
+            hand_id TEXT PRIMARY KEY, ts REAL, agent_id TEXT, competition_id TEXT,
+            seat INTEGER, hole TEXT, board TEXT, payout INTEGER, committed INTEGER,
+            stack INTEGER, score REAL, chip_delta INTEGER, reasoning TEXT, replay_url TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_own_hands_ts ON own_hands(ts)")
+        c.execute("""CREATE TABLE IF NOT EXISTS opp_hands(
+            table_id TEXT, opp_id TEXT, ts REAL, name TEXT, hole TEXT, board TEXT,
+            hand_name TEXT, payout INTEGER, won INTEGER, competition_id TEXT,
+            PRIMARY KEY(table_id, opp_id))""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_opp_hands_opp ON opp_hands(opp_id)")
+        c.execute("""CREATE TABLE IF NOT EXISTS opp_profiles(
+            opp_id TEXT PRIMARY KEY, ts REAL, name TEXT, n INTEGER, vpip REAL, pfr REAL,
+            af REAL, bluff_pct REAL, wtsd REAL, wsd REAL, style TEXT,
+            shown_hands INTEGER, last_seen REAL)""")
 
 
 def log_decision(d: dict):
@@ -182,3 +202,55 @@ def log_mllm_result(d: dict):
         c.execute("INSERT INTO mllm_results(" + ",".join(_MLLM_COLS) + ",ts) VALUES(" +
                   ",".join("?" * len(_MLLM_COLS)) + ",?)",
                   tuple(d.get(k) for k in _MLLM_COLS) + (time.time(),))
+
+
+# ── PokerTracker/HM engine helpers (s7_tracker) ──────────────────────────────
+_OWN_COLS = ("hand_id", "ts", "agent_id", "competition_id", "seat", "hole", "board",
+             "payout", "committed", "stack", "score", "chip_delta", "reasoning", "replay_url")
+
+
+def log_own_hand(d: dict):
+    """Persist one of OUR hands (from /agent/submissions + /replays). Idempotent by hand_id."""
+    if not d.get("hand_id"):
+        return
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO own_hands(" + ",".join(_OWN_COLS) + ") VALUES(" +
+                  ",".join("?" * len(_OWN_COLS)) + ")", tuple(d.get(k) for k in _OWN_COLS))
+
+
+def log_opp_hand(table_id, opp_id, name, hole, board, hand_name, payout, won, competition_id=""):
+    """Persist a rival's shown hand (from /texas/recent-tables seats_shown)."""
+    if not table_id or not opp_id:
+        return
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO opp_hands VALUES(?,?,?,?,?,?,?,?,?,?)",
+                  (str(table_id), str(opp_id), time.time(), name, hole, board,
+                   hand_name, payout, int(bool(won)), competition_id))
+
+
+def upsert_opp_profile(opp_id, name, hud: dict, shown_hands=0):
+    """Tracker's curated per-opponent profile (HUD + count of shown hands)."""
+    if not opp_id:
+        return
+    hud = hud or {}
+    with _conn() as c:
+        c.execute("INSERT OR REPLACE INTO opp_profiles VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                  (str(opp_id), time.time(), name, hud.get("N") or hud.get("sampleSize"),
+                   hud.get("vpip"), hud.get("pfr"), hud.get("af"), hud.get("bluffPct"),
+                   hud.get("wtsd"), hud.get("wsd"),
+                   json.dumps(hud.get("playingStyle"), default=str), shown_hands, time.time()))
+
+
+def get_opp_profile(opp_id):
+    """Read a tracker profile (for s7_reads HUD). Returns the agent-stats-shaped dict or None."""
+    try:
+        with _conn() as c:
+            r = c.execute("SELECT opp_id,name,n,vpip,pfr,af,bluff_pct,wtsd,wsd,style,shown_hands "
+                          "FROM opp_profiles WHERE opp_id=?", (str(opp_id),)).fetchone()
+    except Exception:
+        return None
+    if not r:
+        return None
+    return {"agent_id": r[0], "name": r[1], "N": r[2], "vpip": r[3], "pfr": r[4], "af": r[5],
+            "bluffPct": r[6], "wtsd": r[7], "wsd": r[8],
+            "playingStyle": (json.loads(r[9]) if r[9] else None), "shown_hands": r[10]}

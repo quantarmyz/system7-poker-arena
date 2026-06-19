@@ -28,8 +28,13 @@ def main(argv):
     db = os.environ.get("S7_STATS_DB", "")
     print("[batch] TOTAL=%d MAXC=%d STRAT=%s ENGINE=%s TAG=%s" % (total, maxc, strat, engine, tag), flush=True)
     for i in range(1, total + 1):
+        waited = 0
         while _active(tag) >= maxc:
             time.sleep(20)
+            waited += 20
+            if waited > 6000:        # ~100 min: a slot frees within S7_MATCH_TIMEOUT; never wedge forever
+                print("[batch] gate wait exceeded; proceeding", flush=True)
+                break
         label = "clasif-%s%d-%d" % (tag, i, random.randint(1000, 32767))
         env = {"S7_RUN_LABEL": label, "S7_STRAT": strat, "S7_RANGES": strat,
                "S7_AGENT_NAME": "S7-%s%d" % (tag, i), "S7_SAVE_CREDS": "1"}

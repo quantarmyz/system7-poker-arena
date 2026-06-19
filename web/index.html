@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>System 7 · Arena</title>
+<link rel="stylesheet" href="/web/css/adwaita.css">
+<script src="/web/js/viz.js"></script>
+<script src="/web/js/app.js"></script>
+<script defer src="/web/vendor/alpine.min.js"></script>
+</head>
+<body x-data="app()" x-init="init()">
+
+<header class="headerbar">
+  <span class="brand"><span class="logo"></span> SYSTEM&nbsp;7</span>
+  <span class="live" :class="{'off': !live}" x-text="live ? 'LIVE' : 'OFFLINE'"></span>
+  <nav class="switcher">
+    <button :class="{active: zone==='lab'}" @click="setZone('lab')">🧪 LAB</button>
+    <button :class="{active: zone==='coach'}" @click="setZone('coach')">🎓 COACH</button>
+    <button :class="{active: zone==='production'}" @click="setZone('production')">📡 PRODUCCIÓN</button>
+    <button :class="{active: zone==='help'}" @click="setZone('help')">❓ HELP</button>
+  </nav>
+  <nav class="switcher" title="bifurcación de datos: cash vs torneo (DBs separadas)">
+    <button :class="{active: game==='cash'}" @click="setGameCtx('cash')">♠ CASH</button>
+    <button :class="{active: game==='tournament'}" @click="setGameCtx('tournament')">🏆 TORNEO</button>
+  </nav>
+  <span class="spacer"></span>
+  <div class="kpibar" x-html="renderKpis()"></div>
+</header>
+
+<!-- ════════════ LAB ════════════ -->
+<main class="view" x-show="zone==='lab'">
+  <div class="grid">
+    <div class="card col-8">
+      <h3>Agentes <span class="sub">estrategia · motor · bb/100 ± IC95</span>
+        <span class="spacer"></span>
+        <button class="btn sm" @click="newAgent('cash')">+ cash</button>
+        <button class="btn sm" @click="newAgent('tournament')">+ torneo</button>
+      </h3>
+      <div class="body tight" x-html="renderAgents()" @click="onAgentsClick($event)"></div>
+    </div>
+    <div class="card col-4">
+      <h3>Evaluar contra el Eval</h3>
+      <div class="body">
+        <div class="row">
+          <label class="field">agente
+            <select x-model="evalForm.agent"><template x-for="a in agents" :key="a.name"><option x-text="a.name"></option></template></select>
+          </label>
+          <label class="field">etiqueta del grupo <input x-model="evalForm.group" placeholder="(= agente)" maxlength="24" style="width:130px"></label>
+          <label class="field">nº agentes <input type="number" min="1" max="50" x-model.number="evalForm.total" style="width:70px"></label>
+          <label class="field">a la vez <input type="number" min="1" :max="evalMaxc" x-model.number="evalForm.maxc" style="width:64px"></label>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button class="btn suggested" @click="evalAgent()">▶ lanzar evaluación</button>
+          <span class="dim" x-text="evalMsg"></span>
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:6px">Registra N agentes desechables que juegan 500 manos vs el panel; el report agrega su bb/100 con IC (1 run tiene ±20 de ruido).</div>
+        <div style="margin-top:10px" x-html="renderRuns()" @click="onRowClick($event)"></div>
+      </div>
+    </div>
+
+    <div class="card col-12">
+      <h3>Monitor de evaluación <span class="sub">en vivo · por tarea</span>
+        <span class="spacer"></span>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">tarea
+          <select x-model="task" @change="loadTask()"><option value="">(elige grupo)</option>
+            <template x-for="g in groups" :key="g.group"><option :value="g.group" x-text="(g.active?'▶ ':'') + g.group + ' · ' + (g.agent||'')"></option></template></select></label>
+      </h3>
+      <div class="body" x-html="renderTaskMonitor()" @click="onTaskClick($event)"></div>
+    </div>
+    <div class="card col-12" x-show="builder">
+      <h3>Diseñar agente <span class="sub">clic en la rejilla = añade/quita mano</span></h3>
+      <div class="body" x-html="renderBuilder()" @click="onBuilderClick($event)" @change="onBuilderChange($event)"></div>
+    </div>
+
+    <div class="card col-12" x-show="report">
+      <h3>Report <span class="sub" x-text="report ? report.agent : ''"></span></h3>
+      <div class="body" x-html="renderReport()" @click="onRowClick($event)"></div>
+    </div>
+  </div>
+</main>
+
+<!-- ════════════ COACH ════════════ -->
+<main class="view" x-show="zone==='coach'">
+  <div class="grid">
+    <div class="card col-12">
+      <h3>Diagnóstico
+        <span class="spacer"></span>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">agente
+          <select x-model="coachForm.agent" @change="loadCoach()"><option value="">(todos)</option><template x-for="a in agents" :key="a.name"><option x-text="a.name"></option></template></select>
+        </label>
+        <label class="field" style="flex-direction:row;align-items:center;gap:6px">ventana
+          <select x-model="coachForm.window" @change="loadCoach()"><option value="all">todas</option><option value="10000">últimas 10k</option></select>
+        </label>
+      </h3>
+      <div class="body" x-html="renderCoach()"></div>
+    </div>
+    <div class="card col-6">
+      <h3>Coach IA (M3)</h3>
+      <div class="body">
+        <button class="btn suggested" @click="coachLLM()">🧠 pedir análisis</button>
+        <div style="margin-top:10px;white-space:pre-wrap;font-size:13px" x-html="coachText"></div>
+      </div>
+    </div>
+    <div class="card col-6">
+      <h3>Crear estrategia (jugador pro)</h3>
+      <div class="body">
+        <div class="row">
+          <label class="toggle"><input type="radio" name="sg" value="leaks" x-model="sgMode"> corregir leaks</label>
+          <label class="toggle"><input type="radio" name="sg" value="scratch" x-model="sgMode"> ideal desde cero</label>
+          <button class="btn suggested" @click="genStrategy()">🧠 generar</button>
+        </div>
+        <div class="dim" style="font-size:12px;margin-top:6px">La propuesta se abre en el builder del LAB para revisar, nombrar y guardar como agente.</div>
+        <div style="margin-top:8px" x-text="sgMsg"></div>
+      </div>
+    </div>
+  </div>
+</main>
+
+<!-- ════════════ PRODUCCIÓN ════════════ -->
+<main class="view" x-show="zone==='production'">
+  <div class="grid">
+    <div class="card col-6">
+      <h3>Jugar evento <span class="sub">agente + evento · 1 activo + cola</span></h3>
+      <div class="body">
+        <div class="row">
+          <label class="field">agente
+            <select x-model="deployForm.agent"><template x-for="a in agents" :key="a.name"><option :value="a.name" x-text="a.title || a.name"></option></template></select></label>
+          <label class="field">evento
+            <select x-model="deployForm.competition"><template x-for="c in prodComps" :key="c.id"><option :value="c.id" x-text="c.name + (c.paid ? ' 💸' : '')"></option></template></select></label>
+          <button class="btn suggested" @click="deploy(deployForm.agent, deployForm.competition)">▶ jugar</button>
+        </div>
+        <div class="dim" style="font-size:12px;margin:5px 0">Si ya hay uno jugando, entra en cola (1 a la vez). 💸 = de pago.</div>
+        <div id="prod-msg" class="dim" style="margin-bottom:6px"></div>
+        <div x-html="renderProdControl()" @click="onProdClick($event)"></div>
+      </div>
+    </div>
+    <div class="card col-6">
+      <h3>🏆 Ranking <span class="sub">mejores agentes · reclamar</span></h3>
+      <div class="body tight scroll" x-html="renderRank()" @click="onProdClick($event)"></div>
+    </div>
+    <div class="card col-12">
+      <h3>🏅 Mi agente (cuenta) <span class="sub">tu agente reclamado · posición por evento</span>
+        <span class="spacer"></span>
+        <button class="btn sm" @click="loadAccount()">↻ actualizar</button>
+      </h3>
+      <div class="body" x-html="renderAccount()"></div>
+    </div>
+    <div class="card col-12">
+      <h3>🟢 En vivo <span class="sub">agentes jugando ahora</span></h3>
+      <div class="body" x-html="renderLive()" @click="onProdClick($event)"></div>
+    </div>
+    <div class="card col-12">
+      <h3>📜 Log del agente en vivo <span class="sub">join · manos · timeouts · errores · auto-refresco</span></h3>
+      <div class="body"><pre class="log" x-text="prodLog || '(ningún agente activo o sin salida todavía)'"></pre></div>
+    </div>
+    <div class="card col-12">
+      <h3>Manos en vivo <span class="sub">clic → reproductor · ▶ repro oficial</span></h3>
+      <div class="body" style="padding:8px">
+        <div class="row" style="margin-bottom:6px;gap:6px">
+          <input placeholder="filtrar: AKs · BTN · river · win …" x-model="handFilter" style="flex:1">
+          <button class="btn sm" :class="{suggested: llmOnly}" @click="llmOnly=!llmOnly">🤖 solo LLM</button>
+        </div>
+        <div class="scroll" x-html="renderHands()" @click="onProdClick($event)"></div>
+      </div>
+    </div>
+    <div class="card col-4">
+      <h3>Equity en vivo <span class="sub">REAL vs EV</span>
+        <span class="spacer"></span>
+        <button class="btn sm flat" @click="eqOpt.ev=!eqOpt.ev" x-text="eqOpt.ev?'ocultar EV':'mostrar EV'"></button>
+      </h3>
+      <div class="body fill" x-html="renderEquity()" @click="onProdClick($event)"></div>
+    </div>
+    <div class="card col-8">
+      <h3>Sesión en juego <span class="sub">preflop 13×13 · postflop · stats (agente seleccionado o global)</span></h3>
+      <div class="body" x-html="renderSession()" @click="onProdClick($event)"></div>
+    </div>
+    <div class="card col-12">
+      <h3>Rivales <span class="sub">tracker (PokerTracker/HM)</span>
+        <span class="spacer"></span>
+        <button class="btn sm" @click="harvest()">↻ cosechar</button>
+      </h3>
+      <div class="body tight scroll" x-html="renderOpponents()"></div>
+    </div>
+  </div>
+</main>
+
+<!-- ════════════ HELP ════════════ -->
+<main class="view" x-show="zone==='help'">
+  <div class="grid">
+
+    <div class="card col-12">
+      <h3>System 7 · qué es y cómo funciona</h3>
+      <div class="body" style="line-height:1.7">
+        <p>System 7 es tu laboratorio para <b>construir, probar y desplegar</b> agentes de póker (NLHE 6-max) en el <b>dev.fun Arena</b>. La interfaz sigue el <b>ciclo de vida de un agente</b> en 3 zonas, de izquierda a derecha:</p>
+        <div class="row" style="gap:8px;margin:8px 0;flex-wrap:wrap">
+          <span class="pill accent">🧪 LAB · crear + evaluar</span> <span class="dim">→</span>
+          <span class="pill accent">🎓 COACH · diagnosticar + ajustar</span> <span class="dim">→</span>
+          <span class="pill accent">📡 PRODUCCIÓN · jugar eventos reales</span>
+        </div>
+        <p class="dim">Arriba a la derecha, el toggle <b>♠ CASH / 🏆 TORNEO</b> separa por completo los dos tipos de juego: cada uno tiene su propia base de datos, sus agentes, sus manos y su ranking. <b>Elige el tipo de juego antes de empezar.</b></p>
+      </div>
+    </div>
+
+    <div class="card col-12">
+      <h3>🚀 Get started · montar la pipeline desde cero</h3>
+      <div class="body">
+        <ol style="line-height:2;padding-left:20px">
+          <li><b>Elige el tipo de juego</b> (cabecera): <b>♠ CASH</b> (Eval y Playground, ciegas fijas) o <b>🏆 TORNEO</b> (las ciegas suben).</li>
+          <li><b>LAB → crea un agente</b>: «+ cash» o «+ torneo». En el builder pon <b>nombre</b> y <b>motor</b> (heur o híbrido), y ajusta:
+            <ul style="margin:4px 0">
+              <li><b>Cash</b>: la <b>modalidad</b> (AGR/NIT/STD) y las 6 rejillas de apertura por posición.</li>
+              <li><b>Torneo</b>: las pestañas por <b>tramo de BBs</b> (deep / mid / short / push) — el tramo push es shove/fold.</li>
+            </ul>
+            Ajusta también el <b>sizing postflop</b>, los <b>knobs</b> y los rangos de <b>3bet</b>, y pulsa <b>💾 guardar</b>.</li>
+          <li><b>LAB → evalúa</b>: elige el agente y el nº de agentes, «▶ lanzar evaluación». Juegan 500 manos cada uno contra el panel near-GTO.</li>
+          <li><b>LAB → report</b>: mira el <b>bb/100 agregado ± IC95</b> (un solo run tiene ±20 de ruido; por eso se agregan varios).</li>
+          <li><b>COACH → diagnostica</b>: revisa «tu juego vs el óptimo» y los leaks; pide <b>análisis a la IA</b> o <b>genera una estrategia</b> con el jugador pro (se abre en el builder para afinar y guardar).</li>
+          <li><b>Repite</b> evaluar → coach → ajustar hasta que el bb/100 te convenza.</li>
+          <li><b>PRODUCCIÓN → juega</b>: elige agente + <b>evento</b> (Eval / Tournament / Playground) y «▶ jugar». Se juega 1 a la vez; el resto entra en <b>cola</b>.</li>
+          <li><b>Reclama</b>: en el <b>🏆 Ranking</b>, pulsa reclamar en tus mejores agentes para vincularlos a tu cuenta dev.fun y entrar en la clasificación.</li>
+        </ol>
+      </div>
+    </div>
+
+    <div class="card col-6">
+      <h3>🧪 LAB · crear y evaluar</h3>
+      <div class="body" style="line-height:1.7">
+        <p>Un «agente» es un paquete: <b>estrategia + motor + modelo + ajustes</b>. En el builder:</p>
+        <ul>
+          <li><b>nombre</b>: identificador (a-z 0-9 _ -).</li>
+          <li><b>juego</b>: cash o torneo (define la BD y el tipo de rangos).</li>
+          <li><b>modalidad</b> (cash): <b>AGR</b> agresivo/ancho · <b>STD</b> equilibrado · <b>NIT</b> tight. Al cambiarla, las rejillas se resiembran con ese estilo.</li>
+          <li><b>motor</b>: <b>heur</b> = heurística pura (gratis, instantánea) · <b>hybrid</b> = heurística + LLM en los spots difíciles.</li>
+          <li><b>modelo / proveedor</b>: el LLM del motor híbrido (minimax / openrouter / xiaomi).</li>
+          <li><b>HUD / tracker</b>: usar perfiles de rival para el node-locking.</li>
+          <li><b>rejillas 13×13</b>: clic = añade/quita esa mano del rango de apertura, por posición (cash) o por tramo de BBs (torneo).</li>
+          <li><b>POSTFLOP</b>: matriz de <b>sizing</b> (fracción de bote por textura × calle) + <b>knobs</b> (equity de valor, frac. de cbet farol, SPR de commit, perejil…).</li>
+          <li><b>3bet valor / farol</b>: manos con las que resubes por valor o como farol.</li>
+        </ul>
+        <p><b>Evaluar</b> lanza N agentes desechables (500 manos vs el panel); el <b>Report</b> agrega su bb/100 por estrategia con IC95.</p>
+      </div>
+    </div>
+
+    <div class="card col-6">
+      <h3>🎓 COACH · diagnosticar y ajustar</h3>
+      <div class="body" style="line-height:1.7">
+        <p>Analiza un agente ya probado y te dice dónde falla.</p>
+        <ul>
+          <li><b>ventana</b>: todas las manos o las últimas 10k.</li>
+          <li><b>tu juego vs el mejor juego</b>: VPIP / PFR / Gap / C-bet vs las bandas GTO 6-max, con veredicto ✓/⚠/✗, y tu bb/100 real vs el panel.</li>
+          <li><b>consejos</b>: reglas accionables (qué leaks corregir, por posición).</li>
+          <li><b>Coach IA (M3)</b>: análisis + propuesta de versión.</li>
+          <li><b>Crear estrategia (jugador pro)</b>: «corregir mis leaks» o «ideal desde cero» → estrategia completa que se abre en el builder del LAB.</li>
+        </ul>
+        <p class="dim">Bucle: evalúa → coach → ajusta → vuelve a evaluar.</p>
+      </div>
+    </div>
+
+    <div class="card col-12">
+      <h3>📡 PRODUCCIÓN · jugar eventos reales</h3>
+      <div class="body" style="line-height:1.7">
+        <ul>
+          <li><b>Jugar evento</b>: elige <b>agente</b> + <b>evento</b> (Eval · Tournament 💸 de pago · Playground) y «▶ jugar». Se juega <b>1 a la vez</b>; si hay uno activo, el resto entra en <b>cola</b> (✕ para quitar). El activo tiene <b>parar</b> y <b>🏆 reclamar</b>.</li>
+          <li><b>🏆 Ranking</b>: tus mejores agentes por bb/100 con botón de reclamar (los vincula a tu cuenta dev.fun y entran en la clasificación oficial).</li>
+          <li><b>Manos en vivo</b>: las manos que van ocurriendo, con auto-refresco; clic → reproductor (mesa local + enlace al <b>reproductor oficial</b> de dev.fun).</li>
+          <li><b>Equity en vivo</b>: curva REAL vs EV.</li>
+          <li><b>Rivales (tracker)</b>: el motor tipo PokerTracker/HM agrega cartas mostradas + stats de rivales (botón «↻ cosechar») para perfilarlos.</li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card col-12">
+      <h3>Conceptos clave</h3>
+      <div class="body" style="line-height:1.7">
+        <ul>
+          <li><b>Cash vs Torneo</b>: el Eval y el Playground son <b>cash</b> (ciegas fijas 1/2; mantienes profundidad con rebuy). El <b>Torneo</b> sube las ciegas → tu stack en BBs encoge → por eso el torneo usa rangos por <b>tramo de BBs</b> y shove/fold en stacks cortos.</li>
+          <li><b>Motor heur vs hybrid</b>: heur es gratis e instantáneo; hybrid llama a un LLM en los spots difíciles (cuesta tokens y es más lento, pero razona mejor).</li>
+          <li><b>bb/100 + IC</b>: la métrica de beneficio. Un Eval de 500 manos tiene ±20 de ruido → fíate del <b>agregado de varios runs con intervalo de confianza</b>, no de un número suelto.</li>
+          <li><b>Tracker (PT/HM)</b>: solo ve las manos de partidas que juegan tus agentes (como PokerTracker). Brilla en PvP/Torneo, donde los rivales se repiten.</li>
+          <li><b>Reclamar (claim)</b>: vincula un agente registrado a tu cuenta dev.fun para que cuente en la clasificación pública.</li>
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</main>
+
+<!-- modal reproductor -->
+<div class="modal" :class="{open: modalHand}" @click="if($event.target===$el) closeHand()">
+  <div class="sheet wide" x-html="renderHandModal()" @click="onModalClick($event)"></div>
+</div>
+
+</body>
+</html>
