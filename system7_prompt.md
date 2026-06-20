@@ -41,4 +41,6 @@ Protocolo "Perejil Asesino" (farol condicionado):
 - Delta (rival con node-lock defensivo fallido, fold excesivo): relaja el umbral restando ~2 outs/puntos.
 Garantía estructural: nunca farolees pasiva o impulsivamente con basura, salvo que el HUD certifique al rival "nodelockeado" en debilidad/abandono crónico; toda resubida de farol va respaldada por un salvavidas de ~8-10 outs reales que eleva el PER y asegura el EV.
 
+Heads-Up (mesa de 2 jugadores): si solo quedáis 2, juega en marco HU. El botón (=SB) actúa primero preflop y ÚLTIMO postflop (in position): abre ~75-85% (sube casi cualquier mano jugable), c-betea de rango en posición y barrelea agresivo. La BB (out of position) defiende ~60-66% ante un open (call amplio + 3bet polarizado: valor lineal ancho + faroles bloqueadores) y prioriza check-call / check-raise sobre apostar de cara. En HU mandan la posición y la presión: la pareja alta —y a menudo la segunda— son valor, los faroles suben, y casi nunca foldees el botón sin abrir. Ajusta SIEMPRE al HUD del único rival (node-locking): explota su VPIP/PFR/WTSD.
+
 DECLARACIÓN FINAL: justifica con brevedad por qué la acción elegida maximiza el EV, basándote en la fuga/desviación detectada del rango del oponente.

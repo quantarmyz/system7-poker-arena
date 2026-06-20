@@ -144,6 +144,7 @@ except Exception:
 # Tipo de juego + modalidad. base=wide → cash agr (retrocompat). S7_GAME/S7_RANGES override por entorno.
 GAME = str(_CFG.get("game") or os.environ.get("S7_GAME") or "cash").lower()
 MODE = str(_CFG.get("mode") or ("agr" if (_CFG.get("base") == "wide" or os.environ.get("S7_RANGES") == "wide") else "std")).lower()
+_HU = bool(_CFG.get("hu"))      # heads-up (1v1): postflop consciente de posición (botón=SB=IP)
 _bbk = _CFG.get("bb_buckets")
 BB_BUCKETS = _bbk if (isinstance(_bbk, list) and len(_bbk) == 3) else [40, 20, 10]
 _CASH_SETS = {"agr": OPENING_RANGES_AGR, "nit": OPENING_RANGES_NIT, "std": OPENING_RANGES_STD}
@@ -711,19 +712,24 @@ def decide(table: dict, deadline_s: float = 10.0,
         if strength_eff in ("MMF", "MF") or (eq > KN["value_eq"] and not station):
             decision = value_bet()
         elif strength_eff == "MM":
-            decision = _act("check", None, allowed, f"pot control {strength}", FALLBACK_REASONING) \
-                if "check" in avail else value_bet()
+            if _HU and pos == "SB" and ("bet" in avail or "raise" in avail):   # HU IP (botón): bet fino MM (valor/protección)
+                decision = value_bet()
+            else:
+                decision = _act("check", None, allowed, f"pot control {strength}", FALLBACK_REASONING) \
+                    if "check" in avail else value_bet()
         else:
-            # AIR / draw: Perejil bluff vs weakness, else cbet-bluff on overfolder, else check.
+            # AIR / draw: Perejil bluff vs weakness; cbet-bluff on overfolder; en HU el botón (IP) c-betea de rango.
             weak_spot = dyn == "static" and not station
+            hu_ip_cbet = _HU and pos == "SB" and texture in ("dry", "semi")     # range-cbet en posición HU
             if not station and (_perejil_ok(adj_outs, board_len, n_villains, overfolder) or
-                                (overfolder and texture in ("dry", "semi"))):
+                                (overfolder and texture in ("dry", "semi")) or hu_ip_cbet):
                 br = allowed.get("betRange") or {}
-                frac = KN["cbet_bluff_frac"] if overfolder else SIZING[texture][street]
+                frac = KN["cbet_bluff_frac"] if (overfolder or hu_ip_cbet) else SIZING[texture][street]
                 amt = _clamp(int(pot * frac) or bb, br, bb, pot * 2)
                 act = "bet" if "bet" in avail else None
                 if act:
-                    decision = _act(act, amt, allowed, f"perejil bluff {adj_outs}o ({arc})",
+                    decision = _act(act, amt, allowed,
+                                    f"{'cbet IP-HU' if hu_ip_cbet else 'perejil bluff'} {adj_outs}o ({arc})",
                                     _reasoning(act, 0, 0, "AIR", texture, adj_outs))
             if decision is None:
                 decision = _act("check", None, allowed, f"check {strength}", FALLBACK_REASONING) \

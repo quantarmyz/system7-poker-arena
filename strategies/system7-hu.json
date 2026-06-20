@@ -1,0 +1,28 @@
+{
+  "hu": true,
+  "game": "cash",
+  "opening_ranges": {
+    "SB": ["22+", "A2s+", "K2s+", "Q2s+", "J2s+", "T4s+", "95s+", "84s+", "74s+", "63s+", "53s+", "43s", "A2o+", "K2o+", "Q2o+", "J4o+", "T6o+", "96o+", "86o+", "75o+", "65o", "54o"],
+    "BB": ["22+", "A2s+", "K2s+", "Q3s+", "J5s+", "T5s+", "95s+", "84s+", "74s+", "63s+", "53s+", "A2o+", "K2o+", "Q5o+", "J6o+", "T6o+", "96o+", "86o+", "76o", "65o"]
+  },
+  "threebet_value": ["99+", "ATs+", "KJs+", "QJs", "AJo+", "KQo", "AKs", "AKo"],
+  "threebet_bluff": ["A2s", "A3s", "A4s", "A5s", "K9s", "Q9s", "J9s", "T8s", "98s", "87s"],
+  "knobs": {
+    "open_size_bb": 2.5,
+    "threebet_mult": 3.5,
+    "value_eq": 0.55,
+    "station_mult": 1.3,
+    "cbet_bluff_frac": 0.4,
+    "commit_spr": 3,
+    "perejil_flop": 7,
+    "perejil_turn": 9,
+    "perejil_relief": 2,
+    "sizing": {
+      "dry":     {"flop": 0.33, "turn": 0.50, "river": 0.66},
+      "semi":    {"flop": 0.50, "turn": 0.62, "river": 0.72},
+      "coord":   {"flop": 0.60, "turn": 0.72, "river": 0.80},
+      "extreme": {"flop": 0.75, "turn": 0.85, "river": 0.90}
+    }
+  },
+  "note": "Heads-up (1v1, Playground S4). Boton (SB) abre ~78% RFI; BB defiende ~66%; 3bet lineal ancho + faroles bloqueadores; postflop agresivo y consciente de posicion (IP barrelea, OOP check-raise). Metodologia EducaPoker, exploit + node-locking."
+}
