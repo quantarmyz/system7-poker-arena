@@ -57,7 +57,18 @@ import re as _re  # noqa: E402
 import time as _time  # noqa: E402
 
 _orig_call_llm = llm_agent._call_llm
-LAST_M3 = None   # last MiniMax M3 response {model,think,answer,ts}; read by hybrid_system7
+import threading as _threading  # noqa: E402
+
+_M3_TLS = _threading.local()   # per-thread last M3 log => safe for concurrent (PvP) M3 calls
+
+
+def get_last_m3():
+    """Last MiniMax M3 log {model,think,answer,sent,ts} for THIS thread (read by hybrid_system7)."""
+    return getattr(_M3_TLS, "v", None)
+
+
+def clear_last_m3():
+    _M3_TLS.v = None
 
 
 def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
@@ -65,8 +76,7 @@ def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
     Strips the <think>...</think> chain-of-thought MiniMax M2/M3 emit in the
     content. The --dry-run --mock-llm path is left untouched. Returns text or
     None (None => llm_decide falls back to the deterministic engine)."""
-    global LAST_M3
-    LAST_M3 = None
+    _M3_TLS.v = None
     if mock_mod is not None:
         return _orig_call_llm(system, user, max_tokens, model_hint, mock_mod)
     key = os.environ.get("OPENAI_API_KEY")
@@ -75,7 +85,8 @@ def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
     base = os.environ.get("OPENAI_BASE_URL") or "https://api.minimax.io/v1"
     try:
         from openai import OpenAI  # type: ignore
-        client = OpenAI(api_key=key, base_url=base, timeout=90)
+        client = OpenAI(api_key=key, base_url=base,
+                        timeout=float(os.environ.get("S7_LLM_TIMEOUT", "90")))
         model = model_hint or os.environ.get("S7_MODEL", "MiniMax-M3")
         resp = client.chat.completions.create(
             model=model,
@@ -85,8 +96,8 @@ def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
         txt = resp.choices[0].message.content or ""
         answer = _re.sub(r"<think>.*?</think>", "", txt, flags=_re.S).strip()
         tm = _re.search(r"<think>(.*?)</think>", txt, _re.S)
-        LAST_M3 = {"model": model, "think": (tm.group(1).strip()[:2000] if tm else ""),
-                   "answer": answer[:2000], "ts": _time.time()}
+        _M3_TLS.v = {"model": model, "think": (tm.group(1).strip()[:2000] if tm else ""),
+                   "answer": answer[:2000], "sent": str(user or "")[:2500], "ts": _time.time()}
         return answer
     except Exception:
         return None

@@ -473,7 +473,7 @@ def _archetype(st: dict) -> str:
     """Classify a villain from agent-stats. N-gated by sampleSize. Trusts the
     API's own playingStyle label when decisive."""
     n = int(st.get("N") or st.get("sampleSize") or 0)
-    if n < 100:
+    if n < int(os.environ.get("S7_HUD_MIN_N", "500")):      # adapta solo con muestra fiable del Arena
         return "UNKNOWN"
     vpip, pfr, af = _pct(st.get("vpip")), _pct(st.get("pfr")), float(st.get("af") or 0)
     gap = vpip - pfr

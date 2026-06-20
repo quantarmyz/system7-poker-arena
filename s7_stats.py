@@ -17,7 +17,7 @@ _DECISION_COLS = (
     "ts", "table_id", "hand_key", "street", "pos", "ip", "hole", "hand_class",
     "board", "texture", "strength", "spr", "pot", "call_chips", "pot_odds",
     "adj_outs", "n_villains", "archetype", "engine", "action", "amount",
-    "voluntary", "preflop_raise", "run_label", "m3_log", "model",
+    "voluntary", "preflop_raise", "run_label", "m3_log", "model", "agent_id",
 )
 
 
@@ -40,7 +40,8 @@ def init():
             hole TEXT, hand_class TEXT, board TEXT, texture TEXT, strength TEXT,
             spr REAL, pot INTEGER, call_chips INTEGER, pot_odds REAL, adj_outs INTEGER,
             n_villains INTEGER, archetype TEXT, engine TEXT, action TEXT, amount INTEGER,
-            voluntary INTEGER, preflop_raise INTEGER, run_label TEXT, m3_log TEXT, model TEXT)""")
+            voluntary INTEGER, preflop_raise INTEGER, run_label TEXT, m3_log TEXT, model TEXT,
+            agent_id TEXT)""")
         # migrate older DBs that predate run_label / m3_log / model
         cols = {r[1] for r in c.execute("PRAGMA table_info(decisions)")}
         if "run_label" not in cols:
@@ -49,6 +50,9 @@ def init():
             c.execute("ALTER TABLE decisions ADD COLUMN m3_log TEXT")
         if "model" not in cols:
             c.execute("ALTER TABLE decisions ADD COLUMN model TEXT")
+        if "agent_id" not in cols:
+            c.execute("ALTER TABLE decisions ADD COLUMN agent_id TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_decisions_agent ON decisions(agent_id)")
         c.execute("""CREATE TABLE IF NOT EXISTS bankroll(
             ts REAL, table_chips INTEGER, hands INTEGER, rebuys INTEGER, note TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS runs(

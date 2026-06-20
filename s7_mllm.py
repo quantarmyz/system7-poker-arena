@@ -36,6 +36,7 @@ PROVIDERS = {
     "minimax":    ("OPENAI_BASE_URL",     "OPENAI_API_KEY",     "https://api.minimax.io/v1"),
     "openrouter": ("OPENROUTER_BASE_URL", "OPENROUTER_API_KEY", "https://openrouter.ai/api/v1"),
     "xiaomi":     ("XIAOMI_BASE_URL",     "XIAOMI_API_KEY",     None),
+    "deepseek":   ("DEEPSEEK_BASE_URL",   "DEEPSEEK_API_KEY",   "https://api.deepseek.com/v1"),
 }
 
 

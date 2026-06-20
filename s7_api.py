@@ -301,8 +301,38 @@ def _prod_launch(agent, competition):
         env["ARENA_COMPETITION_ID"] = competition
         env["S7_CREDS_FILE"] = os.path.join(_DATA, ".arena-pg-credentials")
         env["S7_RUN_LABEL"] = label
+        # M3 en vivo: llamadas no bloqueantes (pool) + acotadas por reloj (run_pvp async path)
+        env["S7_PVP_ASYNC"] = "1"
+        env["S7_PVP_WORKERS"] = "4"
+        env["S7_PVP_SUBMIT_MARGIN"] = "3"
+        # Modelo RÁPIDO en vivo: M3 (~30s, medido) NO cabe en el reloj del Playground (~28.6s);
+        # MiniMax-M2 (~9s, medido) sí, con razonamiento completo. El Eval sigue con el modelo del perfil.
+        _apply_settings_keys()                              # keys de Settings (settings.json) -> os.environ
+        env.update(_settings().get("keys") or {})           # y al env del run_pvp/tracker
+        _lv = _settings().get("live") or {}                 # modelo en vivo desde Settings
+        try:
+            import s7_mllm
+            _lbase, _lkey = s7_mllm._resolve(_lv.get("provider") or "minimax")
+            if _lbase:
+                env["OPENAI_BASE_URL"] = _lbase
+            if _lkey:
+                env["OPENAI_API_KEY"] = _lkey
+        except Exception:
+            pass
+        env["S7_MODEL"] = _lv.get("model") or os.environ.get("S7_PVP_MODEL", "MiniMax-M2")
+        env["S7_LLM_MIN_DEADLINE"] = "12"      # M2 cabe hasta en deadlines cortos -> más cobertura LLM
+        env["S7_LLM_TIMEOUT"] = "18"           # corta un spike raro (M2 ~9s)
+        env["S7_MAX_TOKENS"] = "1500"          # M2 da answer completo en ~1500 tok
+        env["S7_HUD"] = "1"                     # node-locking por rival (HUD)
+        env["S7_TRACKER"] = "1"                # leer opp_profiles (tracker) antes que el live
+        env["S7_HUD_MIN_N"] = os.environ.get("S7_HUD_MIN_N", "3500")   # adapta solo con >=3500 manos del Arena
         argv = s7_jobs.pyrun("run_pvp.py")
         compname = competition
+        try:                                   # tracker sidecar: opp_profiles (HUD) + opp_hands durante el juego
+            s7_jobs.launch("tracker-" + label, s7_jobs.pyrun("s7_tracker.py", "--interval", "300"),
+                           {**env, "S7_TRACK_MAX_PROFILES": "40"})
+        except Exception:
+            pass
     try:
         unit = s7_jobs.launch(label, argv, env)
     except Exception as e:
@@ -375,7 +405,129 @@ def production_stop(body):
         s7_jobs.stop(unit)
     except Exception as e:
         return {"error": str(e)}
+    try:                                    # parar también el tracker sidecar de ese deploy
+        s7_jobs.stop(unit.replace("arena-run-prod-", "arena-run-tracker-prod-"))
+    except Exception:
+        pass
     return {"ok": True}
+
+
+# ── Settings: API keys de proveedores LLM (.env) + modelo vivo/default ──────────
+_SETTINGS_PATH = os.path.join(_DATA, "settings.json")
+_ENV_PATH = os.path.join(HERE, ".env")
+_PROV_KEY_ENV = {"minimax": "OPENAI_API_KEY", "xiaomi": "XIAOMI_API_KEY",
+                 "openrouter": "OPENROUTER_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
+_PROV_BASE_ENV = {"minimax": "OPENAI_BASE_URL", "xiaomi": "XIAOMI_BASE_URL",
+                  "openrouter": "OPENROUTER_BASE_URL", "deepseek": "DEEPSEEK_BASE_URL"}
+
+
+def _settings():
+    return _jload(_SETTINGS_PATH, {"live": {}, "default": {}})
+
+
+def _settings_save(d):
+    try:
+        with open(_SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=2)
+    except Exception:
+        pass
+
+
+def _env_upsert(var, val):
+    """Reemplaza/añade VAR=val en .env (preserva el resto) + os.environ."""
+    if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,40}", var or ""):
+        return False
+    try:
+        lines = open(_ENV_PATH, encoding="utf-8").read().splitlines()
+    except Exception:
+        lines = []
+    out, found = [], False
+    for ln in lines:
+        if ln.split("=", 1)[0].strip() == var:
+            out.append("%s=%s" % (var, val)); found = True
+        else:
+            out.append(ln)
+    if not found:
+        out.append("%s=%s" % (var, val))
+    try:
+        with open(_ENV_PATH, "w", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n")
+    except Exception:
+        return False
+    os.environ[var] = val
+    return True
+
+
+def settings_get():
+    """Modelo vivo/default + estado por proveedor (ENMASCARADO: nunca devuelve el valor de la key)."""
+    _apply_settings_keys()
+    st = _settings()
+    keys = {p: {"configured": bool(os.environ.get(_PROV_KEY_ENV[p])),
+                "base": os.environ.get(_PROV_BASE_ENV[p]) or ""} for p in _PROV_KEY_ENV}
+    return {"live": st.get("live") or {}, "default": st.get("default") or {}, "keys": keys}
+
+
+def _apply_settings_keys():
+    """Carga las keys persistidas en settings.json (volumen /data) a os.environ (ganan sobre .env)."""
+    for k, v in (_settings().get("keys") or {}).items():
+        if v:
+            os.environ[k] = str(v)
+
+
+def settings_save_key(body):
+    provider = str(body.get("provider", ""))
+    if provider not in _PROV_KEY_ENV:
+        return {"error": "proveedor desconocido"}
+    key = str(body.get("key", "") or "").strip()
+    base = str(body.get("base", "") or "").strip()
+    st = _settings()
+    keys = st.setdefault("keys", {})       # persistente en /data/settings.json (sobrevive rebuilds)
+    if key:
+        keys[_PROV_KEY_ENV[provider]] = key
+        os.environ[_PROV_KEY_ENV[provider]] = key
+    if base:
+        keys[_PROV_BASE_ENV[provider]] = base
+        os.environ[_PROV_BASE_ENV[provider]] = base
+    _settings_save(st)
+    return {"ok": True, "provider": provider, "configured": bool(os.environ.get(_PROV_KEY_ENV[provider]))}
+
+
+def settings_set_model(body):
+    scope = str(body.get("scope", "live"))
+    mid = str(body.get("model", "") or "").strip()         # "provider:model"
+    if scope not in ("live", "default") or not mid:
+        return {"error": "scope o modelo inválido"}
+    prov, model = (mid.split(":", 1) if ":" in mid else ("minimax", mid))
+    st = _settings()
+    st[scope] = {"provider": prov, "model": model, "id": mid}
+    _settings_save(st)
+    if scope == "default":                                  # aplica ya al dashboard (Coach/stratgen)
+        try:
+            import s7_mllm
+            base, key = s7_mllm._resolve(prov)
+            if base:
+                os.environ["OPENAI_BASE_URL"] = base
+            if key:
+                os.environ["OPENAI_API_KEY"] = key
+            os.environ["S7_MODEL"] = model
+        except Exception:
+            pass
+    return {"ok": True, "scope": scope, "provider": prov, "model": model}
+
+
+def settings_apply_live(body=None):
+    """Re-despliega el Playground activo con el modelo live nuevo (lo lee _prod_launch)."""
+    deploys = _jload(_DEPLOYS_PATH, {})
+    pvp = next((a for a in (production_status().get("active") or []) if a.get("continuous")), None)
+    if not pvp:
+        return {"ok": True, "note": "sin Playground activo; el modelo se aplicará al desplegar"}
+    dp = deploys.get(pvp.get("label"), {})
+    agent, comp = dp.get("agent"), dp.get("competition")
+    if not agent or not comp:
+        return {"error": "no se pudo resolver el agente/evento activo"}
+    production_stop({"unit": pvp.get("unit")})
+    time.sleep(1)
+    return _prod_launch(agent, comp)
 
 
 def production_queue_remove(body):
@@ -388,6 +540,14 @@ def production_queue_remove(body):
     return {"ok": True, "queue": _jload(_QUEUE_PATH, [])}
 
 
+def _my_agent_id():
+    """agentId del agente autenticado (.arena-pg-credentials) — unifica las vistas a él."""
+    try:
+        return json.load(open(os.path.join(_DATA, ".arena-pg-credentials"))).get("agentId") or ""
+    except Exception:
+        return ""
+
+
 def production_session(label=""):
     """Stats de la sesión en juego, filtradas por run_label (un agente) o globales (todos):
     rejilla preflop 13×13 (qué manos jugamos), reparto de decisiones postflop por calle y KPIs."""
@@ -398,7 +558,13 @@ def production_session(label=""):
         c = _ro()
     except Exception as e:
         return {"error": str(e)}
-    cond, A = ("run_label like ?", (label + "%",)) if label else ("1=1", ())
+    if label:
+        cond, A = "run_label like ?", (label + "%",)
+    else:                                   # sin label: unificar al agente autenticado
+        _my = _my_agent_id()
+        cond = ("(agent_id = ? OR (agent_id IS NULL AND run_label LIKE 'prod-%' "
+                "AND run_label NOT IN (SELECT run_label FROM runs WHERE agent_id IS NOT NULL AND agent_id != ?)))")
+        A = (_my, _my)
 
     def q(cols, extra="", extra_args=()):
         try:
@@ -527,13 +693,25 @@ def tracker_opponents(limit=200):
     except Exception as e:
         return {"error": str(e)}
     out = []
+    _thr = int(os.environ.get("S7_HUD_MIN_N", "3500"))   # umbral de adaptación (= el del motor)
+    try:
+        import decide_system7 as _DS
+    except Exception:
+        _DS = None
     try:
         for r in c.execute("select opp_id,name,n,vpip,pfr,af,bluff_pct,wtsd,wsd,style,shown_hands,last_seen "
                            "from opp_profiles order by (n is null), n desc limit ?", (limit,)):
+            sty = (json.loads(r[9]) if r[9] else None)
+            arc = "UNKNOWN"
+            if _DS:
+                try:
+                    arc = _DS._archetype({"N": r[2], "vpip": r[3], "pfr": r[4], "af": r[5], "playingStyle": sty})
+                except Exception:
+                    pass
             out.append({"agent_id": r[0], "name": r[1], "n": r[2], "vpip": r[3], "pfr": r[4],
-                        "af": r[5], "bluff": r[6], "wtsd": r[7], "wsd": r[8],
-                        "style": (json.loads(r[9]) if r[9] else None),
-                        "shown_hands": r[10], "last_seen": r[11]})
+                        "af": r[5], "bluff": r[6], "wtsd": r[7], "wsd": r[8], "style": sty,
+                        "shown_hands": r[10], "last_seen": r[11],
+                        "archetype": arc, "adapting": (r[2] or 0) >= _thr})
     except Exception:
         pass
     c.close()

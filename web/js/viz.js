@@ -176,7 +176,7 @@ function streetSections(h, evs){
 function m3Block(h){
   const ds=(h.decisions||[]).filter(d=>d.m3);
   if(!ds.length) return "";
-  const items=ds.map(d=>`<details style="margin:4px 0"><summary style="cursor:pointer;color:var(--purple);font-weight:600">🤖 ${esc(d.street||"")} · ${esc(d.action||"")}${d.amount?(" "+d.amount):""} <span class="dim" style="font-weight:400">(${esc(d.m3.model||"M3")})</span></summary><div class="mono" style="font-size:11px;white-space:pre-wrap;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:4px"><b>answer:</b>\n${esc(d.m3.answer||"(vacío)")}\n\n<b>think:</b>\n${esc(d.m3.think||"(sin think)")}</div></details>`).join("");
+  const items=ds.map(d=>`<details style="margin:4px 0"><summary style="cursor:pointer;color:var(--purple);font-weight:600">🤖 ${esc(d.street||"")} · ${esc(d.action||"")}${d.amount?(" "+d.amount):""} <span class="dim" style="font-weight:400">(${esc(d.m3.model||"M3")})</span></summary><div class="mono" style="font-size:11px;white-space:pre-wrap;background:var(--bg3);border:1px solid var(--border);border-radius:6px;padding:8px;margin-top:4px"><b>📤 enviado a la LLM:</b>\n${esc(d.m3.sent||"(no guardado — solo en manos nuevas)")}\n\n<b>📥 respuesta de la LLM:</b>\n${esc(d.m3.answer||"(vacío)")}\n\n<b>🧠 think:</b>\n${esc(d.m3.think||"(sin think)")}</div></details>`).join("");
   return `<div class="card" style="margin-top:8px;border-color:var(--purple)"><h3>🤖 Razonamiento del LLM · ${ds.length} decisión(es) con M3</h3><div class="body">${items}</div></div>`;
 }
 

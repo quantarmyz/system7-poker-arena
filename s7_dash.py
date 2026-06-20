@@ -255,15 +255,30 @@ def _hand(key):
                            "engine": d[12], "m3": (_lj(d[13]) or None) if d[13] else None} for d in decs]}
 
 
+# Filtro "solo mi agente autenticado": decisiones tagueadas con mi agentId, MÁS las del Playground
+# (prod-* que NO son runs de Eval) que aún no estaban tagueadas. Excluye los s7t-* desechables del Eval.
+_MY_DEC = ("(agent_id = ? OR (agent_id IS NULL AND run_label LIKE 'prod-%' "
+           "AND run_label NOT IN (SELECT run_label FROM runs WHERE agent_id IS NOT NULL AND agent_id != ?)))")
+
+
+def _my_agent_id():
+    """agentId del agente autenticado/reclamado (.arena-pg-credentials) — unifica el dashboard a él."""
+    try:
+        return json.load(open(os.path.join(s7_api._DATA, ".arena-pg-credentials"))).get("agentId") or ""
+    except Exception:
+        return ""
+
+
 def _hands(limit=600):
     """Summary of every recent hand (grouped from decisions) for the MANOS grid."""
     try:
         c = _ro()
     except Exception as e:
         return {"hands": [], "error": str(e)}
+    my = _my_agent_id()
     rows = c.execute(
         "select ts,hand_key,street,pos,hole,hand_class,board,action,amount,engine,run_label,pot,spr "
-        "from decisions order by ts desc limit ?", (limit * 6,)).fetchall()
+        "from decisions where " + _MY_DEC + " order by ts desc limit ?", (my, my, limit * 6)).fetchall()
     resmap = {}
     try:
         for tid, delta, winners, rboard in c.execute("select table_id, chip_delta, winners, board from hand_results"):
@@ -353,9 +368,13 @@ def _players(limit=400):
         return {"players": [], "error": str(e)}
     hud = {}
     try:
-        for r in c.execute("select agent_id,name,n,vpip,pfr,af,bluff_pct,wtsd,wsd,style from agent_stats"):
+        import decide_system7 as _DS
+        for r in c.execute("select opp_id,name,n,vpip,pfr,af,bluff_pct,wtsd,wsd,style,shown_hands,last_seen "
+                           "from opp_profiles"):
+            arc = _DS._archetype({"N": r[2], "vpip": r[3], "pfr": r[4], "af": r[5], "playingStyle": _lj(r[9], {})})
             hud[r[1]] = {"agent_id": r[0], "n": r[2], "vpip": r[3], "pfr": r[4], "af": r[5],
-                         "bluff": r[6], "wtsd": r[7], "wsd": r[8], "style": _lj(r[9], {})}
+                         "bluff": r[6], "wtsd": r[7], "wsd": r[8], "style": _lj(r[9], {}),
+                         "shown": r[10], "last_seen": r[11], "archetype": arc, "adapting": arc != "UNKNOWN"}
     except Exception:
         pass
     tidkey = {}
@@ -997,11 +1016,14 @@ MLLM_PRESETS = [
     {"id": "openrouter:meta-llama/llama-3.3-70b-instruct", "provider": "openrouter", "label": "Llama 3.3 70B"},
     {"id": "openrouter:qwen/qwen-2.5-72b-instruct", "provider": "openrouter", "label": "Qwen 2.5 72B"},
     {"id": "xiaomi:MiMo-7B-RL", "provider": "xiaomi", "label": "Xiaomi MiMo"},
+    {"id": "minimax:MiniMax-M2", "provider": "minimax", "label": "MiniMax M2 (rápido · vivo)"},
+    {"id": "deepseek:deepseek-chat", "provider": "deepseek", "label": "DeepSeek V3 (rápido)"},
+    {"id": "deepseek:deepseek-reasoner", "provider": "deepseek", "label": "DeepSeek R1 (lento)"},
 ]
 
 
 def _mllm_models():
-    prov = {p: bool(s7_mllm and s7_mllm.provider_ready(p)) for p in ("minimax", "openrouter", "xiaomi")}
+    prov = {p: bool(s7_mllm and s7_mllm.provider_ready(p)) for p in ("minimax", "openrouter", "xiaomi", "deepseek")}
     return {"presets": MLLM_PRESETS, "providers": prov}
 
 
@@ -1117,10 +1139,13 @@ def _rank():
     except Exception:
         deploys = {}
     _names = {"cmqf827h30u7dfca3x2aqvzjv": "Playground", "cmqggiv9k37am11ydmppz466e": "Torneo"}
+    my = _my_agent_id()
     rows = []
     for lbl in set(creds) | set(deploys):
         cr = creds.get(lbl, {})
         dp = deploys.get(lbl, {})
+        if not ((lbl in deploys) or (my and cr.get("agentId") == my)):   # solo el agente autenticado
+            continue
         comp = str(cr.get("competition") or dp.get("competition") or "")
         is_eval = comp == "seed_poker_eval_s1" or "eval" in comp.lower()
         rows.append({"label": lbl, "name": dp.get("agent") or cr.get("name") or lbl,
@@ -2161,6 +2186,10 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/mllm/models"):
             self._send(json.dumps(_mllm_models(), default=str), "application/json")
             return
+        if p.startswith("/api/settings"):
+            _s = s7_api.settings_get(); _s.update(_mllm_models())   # live/default/keys + presets/providers
+            self._send(json.dumps(_s, default=str), "application/json")
+            return
         if p.startswith("/api/mllm/runs"):
             self._send(json.dumps(_mllm_runs(), default=str), "application/json")
             return
@@ -2217,6 +2246,12 @@ class H(BaseHTTPRequestHandler):
             reply(s7_api.production_stop(body)); return
         if p.startswith("/api/tracker/harvest"):
             reply(s7_api.tracker_harvest()); return
+        if p.startswith("/api/settings/key"):
+            reply(s7_api.settings_save_key(body)); return
+        if p.startswith("/api/settings/model"):
+            reply(s7_api.settings_set_model(body)); return
+        if p.startswith("/api/settings/apply"):
+            reply(s7_api.settings_apply_live(body)); return
         if p.startswith("/api/strats/save"):
             reply(_save_strat(body))
             return

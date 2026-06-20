@@ -17,6 +17,8 @@ function app() {
     coachForm: { agent: "", window: "all" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
     prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "eval" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
     modalHand: null, step: 0, embed: true, eqOpt: { ev: true, off: {} },
+    settings: {}, keyInput: {}, baseInput: {}, liveModel: "", defModel: "", settingsMsg: "", settingsMsg2: "",
+    settingsProviders: [{ id: "minimax", label: "MiniMax" }, { id: "xiaomi", label: "Xiaomi MiMo", needBase: true }, { id: "openrouter", label: "OpenRouter" }, { id: "deepseek", label: "DeepSeek" }],
 
     init() {
       CTXGAME = this.game; this.tick(); this.loadAgents(); this.loadRuns();
@@ -36,6 +38,7 @@ function app() {
       if (z === "lab") { this.loadAgents(); this.loadRuns(); this.loadGroups(); }
       if (z === "coach") { this.loadAgents(); this.loadCoach(); }
       if (z === "production") { this.loadProd(); this.loadCompetitions(); this.loadRank(); this.loadHands(); this.loadOpponents(); this.loadSession(); this.loadAccount(); }
+      if (z === "settings") { this.loadSettings(); }
     },
 
     renderKpis() {
@@ -387,14 +390,42 @@ function app() {
         || (f === "win" && h.won) || (f === "m3" && h.m3 > 0)).slice(0, 250);
       const hdr = this.prodSel ? `<div class="row" style="margin-bottom:6px"><span class="pill accent">solo «${esc(this.prodSelName || this.prodSel)}»</span> <button class="btn sm flat" data-selall="1">ver todos</button></div>` : "";
       if (!rows.length) return hdr + `<div class="empty">sin manos${this.prodSel ? " de este agente todavía" : ""}</div>`;
-      return hdr + `<table class="list"><thead><tr><th>hora</th><th>arm</th><th>modo</th><th>pos</th><th>mano</th><th>board</th><th>flop</th><th>turn</th><th>river</th><th>fold</th><th>calle</th><th class="num">bote</th><th class="num">result</th></tr></thead><tbody>${rows.map(h => `<tr class="clk" data-key="${encodeURIComponent(h.key)}"><td class="dim">${tt(h.ts)}</td><td>${esc(h.label || "·")}</td><td>${h.m3 > 0 ? `<b class="pos">LLM-m3</b>${h.m3 > 1 ? ` <span class="dim">${h.m3}</span>` : ""}` : '<span class="dim">HEUR</span>'}</td><td>${esc(h.pos || "")}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim">${esc(h.act_flop || "·")}</td><td class="dim">${esc(h.act_turn || "·")}</td><td class="dim">${esc(h.act_river || "·")}</td><td>${!h.fold ? '<span class="pos">—</span>' : (h.fold === "preflop" ? '<span class="dim">PF</span>' : '<span class="pill amber">' + esc(h.fold) + '</span>')}</td><td>${esc(h.reached || "")}</td><td class="num">${h.pot}</td><td class="num">${h.delta == null ? "·" : `<b class="${h.delta >= 0 ? "pos" : "neg"}">${h.delta >= 0 ? "+" : ""}${h.delta}</b>`}</td></tr>`).join("")}</tbody></table>`;
+      return hdr + `<table class="list"><thead><tr><th>hora</th><th>arm</th><th>modo</th><th>pos</th><th>mano</th><th>board</th><th>flop</th><th>turn</th><th>river</th><th>fold</th><th>calle</th><th class="num">bote</th><th class="num">result</th></tr></thead><tbody>${rows.map(h => `<tr class="clk" data-key="${encodeURIComponent(h.key)}"><td class="dim">${tt(h.ts)}</td><td>${esc(h.label || "·")}</td><td>${h.m3 > 0 ? `<b class="pos" title="click en la mano → ver mensaje enviado y respuesta de la LLM" style="cursor:pointer;text-decoration:underline dotted">LLM</b>${h.m3 > 1 ? ` <span class="dim">${h.m3}</span>` : ""}` : '<span class="dim">HEUR</span>'}</td><td>${esc(h.pos || "")}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim">${esc(h.act_flop || "·")}</td><td class="dim">${esc(h.act_turn || "·")}</td><td class="dim">${esc(h.act_river || "·")}</td><td>${!h.fold ? '<span class="pos">—</span>' : (h.fold === "preflop" ? '<span class="dim">PF</span>' : '<span class="pill amber">' + esc(h.fold) + '</span>')}</td><td>${esc(h.reached || "")}</td><td class="num">${h.pot}</td><td class="num">${h.delta == null ? "·" : `<b class="${h.delta >= 0 ? "pos" : "neg"}">${h.delta >= 0 ? "+" : ""}${h.delta}</b>`}</td></tr>`).join("")}</tbody></table>`;
     },
     async loadOpponents() { const d = await jget("/api/tracker/opponents"); this.opponents = d.opponents || []; },
     renderOpponents() {
-      if (!this.opponents.length) return '<div class="empty">sin rivales aún — pulsa «cosechar» tras jugar manos</div>';
-      return `<table class="list"><thead><tr><th>rival</th><th class="num">N</th><th class="num">VPIP</th><th class="num">PFR</th><th class="num">AF</th><th class="num">manos vistas</th></tr></thead><tbody>${this.opponents.map(o => `<tr><td><b>${esc(o.name || o.agent_id)}</b></td><td class="num">${o.n == null ? "—" : Number(o.n).toLocaleString()}</td><td class="num">${pct(o.vpip)}</td><td class="num">${pct(o.pfr)}</td><td class="num">${o.af == null ? "—" : (+o.af).toFixed(1)}</td><td class="num">${o.shown_hands || 0}</td></tr>`).join("")}</tbody></table>`;
+      if (!this.opponents.length) return '<div class="empty">sin rivales aún — se llena solo durante el juego (HUD del Arena)</div>';
+      return `<table class="list"><thead><tr><th>rival</th><th>estilo</th><th class="num">N</th><th class="num">VPIP</th><th class="num">PFR</th><th class="num">AF</th><th class="num">WTSD</th><th class="num">vistas</th></tr></thead><tbody>${this.opponents.map(o => `<tr><td><b>${esc(o.name || o.agent_id)}</b></td><td>${o.adapting ? `<span class="pill green">${esc(o.archetype)} · adaptando</span>` : `<span class="dim">${o.archetype === "UNKNOWN" ? "&lt;500 manos" : esc(o.archetype || "?")}</span>`}</td><td class="num">${o.n == null ? "—" : Number(o.n).toLocaleString()}</td><td class="num">${pct(o.vpip)}</td><td class="num">${pct(o.pfr)}</td><td class="num">${o.af == null ? "—" : (+o.af).toFixed(1)}</td><td class="num">${pct(o.wtsd)}</td><td class="num">${o.shown_hands || 0}</td></tr>`).join("")}</tbody></table>`;
     },
     async harvest() { await jpost("/api/tracker/harvest", {}); setTimeout(() => this.loadOpponents(), 1500); },
+    async loadSettings() {
+      this.settings = await jget("/api/settings");
+      this.liveModel = (this.settings.live || {}).id || "";
+      this.defModel = (this.settings.default || {}).id || "";
+    },
+    providerReady(p) { return !!((this.settings.providers || {})[p]); },
+    async saveKey(provider) {
+      const key = (this.keyInput[provider] || "").trim(), base = (this.baseInput[provider] || "").trim();
+      if (!key && !base) { this.settingsMsg = "pega una API key primero"; return; }
+      const r = await jpost("/api/settings/key", { provider, key, base });
+      this.keyInput[provider] = "";
+      this.settingsMsg = r.error ? ("error: " + r.error) : (provider + ": guardada ✓");
+      await this.loadSettings();
+      setTimeout(() => { this.settingsMsg = ""; }, 4000);
+    },
+    async applyLive() {
+      if (!this.liveModel) return;
+      await jpost("/api/settings/model", { scope: "live", model: this.liveModel });
+      const r = await jpost("/api/settings/apply", {});
+      this.settingsMsg2 = r.error ? ("error: " + r.error) : (r.note || ("aplicado en vivo: " + this.liveModel + " (re-desplegado)"));
+      setTimeout(() => { this.settingsMsg2 = ""; }, 6000);
+    },
+    async saveDefault() {
+      if (!this.defModel) return;
+      const r = await jpost("/api/settings/model", { scope: "default", model: this.defModel });
+      this.settingsMsg2 = r.error ? ("error: " + r.error) : ("default: " + this.defModel + " ✓");
+      setTimeout(() => { this.settingsMsg2 = ""; }, 4000);
+    },
 
     /* ───── reproductor ───── */
     async openHand(key) { if (!key) return; const h = await jget("/api/hand?key=" + encodeURIComponent(key)); h._ev = buildTimeline(h); this.modalHand = h; this.step = 0; this.embed = !!(h.result && h.result.replay_url); },

@@ -53,7 +53,7 @@ def decide(table: dict, deadline_s: float = 10.0, research_context=None) -> dict
     if _is_hard(table, deadline_s):
         a = llm_agent.llm_decide(table, deadline_s=deadline_s, research_context=research_context)
         a["message"] = ("[M3] " + str(a.get("message", "")))[:500]
-        a["m3"] = getattr(llm_system7, "LAST_M3", None)   # raw model log for the replayer
-        llm_system7.LAST_M3 = None
+        a["m3"] = llm_system7.get_last_m3()               # raw model log (thread-local; PvP-safe)
+        llm_system7.clear_last_m3()
         return a
     return H.decide(table, deadline_s=deadline_s, research_context=research_context)

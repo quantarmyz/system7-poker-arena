@@ -122,8 +122,10 @@ def _harvest_own(c, agent_id, rmap):
 def _harvest_tables(c, agent_id, rmap):
     """/texas/recent-tables → hand_results + opp_hands. Devuelve {oppId: {name, comp}}."""
     opps = {}
+    comp_q = os.environ.get("ARENA_COMPETITION_ID") or ""   # recent-tables EXIGE competitionId (si no, 400)
+    url = f"/texas/recent-tables?limit=100&agentId={agent_id}" + (f"&competitionId={comp_q}" if comp_q else "")
     try:
-        rt = c.get(f"/texas/recent-tables?limit=100&agentId={agent_id}")
+        rt = c.get(url)
     except ArenaError:
         return opps
     data = rt.get("data") if isinstance(rt, dict) else (rt if isinstance(rt, list) else [])
@@ -148,20 +150,34 @@ def _harvest_tables(c, agent_id, rmap):
                                  rr.get("replay_url") or "")
         for s in seats:
             oid = s.get("agentId")
-            if not oid or oid == agent_id or not s.get("holeCards"):
+            if not oid or oid == agent_id:
                 continue
-            s7_stats.log_opp_hand(str(tid), oid, s.get("agentName") or oid,
-                                  ",".join(s.get("holeCards") or []), board,
-                                  s.get("handName") or "", s.get("payoutChips") or 0,
-                                  oid in winset, comp)
-            opps[oid] = {"name": s.get("agentName") or oid, "comp": comp}
+            opps[oid] = {"name": s.get("agentName") or oid, "comp": comp}    # perfilar TODOS los rivales
+            if s.get("holeCards"):                                           # archivar solo manos mostradas
+                s7_stats.log_opp_hand(str(tid), oid, s.get("agentName") or oid,
+                                      ",".join(s.get("holeCards") or []), board,
+                                      s.get("handName") or "", s.get("payoutChips") or 0,
+                                      oid in winset, comp)
     return opps
 
 
 def _harvest_profiles(c, opps):
-    """/texas/agent-stats por rival → opp_profiles (con recuento de manos mostradas)."""
-    for oid, info in opps.items():
-        name, comp = info.get("name") or oid, info.get("comp") or ""
+    """/texas/agent-stats por rival → opp_profiles. Acotado a S7_TRACK_MAX_PROFILES/pasada (anti-429):
+    salta rivales con perfil <1h y procesa hasta el cap del resto (cubre distintos rivales por pasada)."""
+    cap = int(os.environ.get("S7_TRACK_MAX_PROFILES", "40"))
+    now = time.time()
+    fresh = set()
+    try:
+        for oid, ls, n in sqlite3.connect(s7_stats.DB, timeout=20).execute(
+                "select opp_id, last_seen, n from opp_profiles"):
+            if ls and now - ls < 3600 and n is not None:   # no saltar perfiles fallidos (N null): reintentar
+                fresh.add(str(oid))
+    except Exception:
+        pass
+    todo = [(oid, info) for oid, info in opps.items() if str(oid) not in fresh][:cap]
+    for oid, info in todo:
+        name = info.get("name") or oid
+        comp = info.get("comp") or os.environ.get("ARENA_COMPETITION_ID") or ""   # agent-stats EXIGE comp
         url = f"/texas/agent-stats?agentId={oid}" + (f"&competitionId={comp}" if comp else "")
         try:
             raw = c.get(url)

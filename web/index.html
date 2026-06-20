@@ -19,6 +19,7 @@
     <button :class="{active: zone==='coach'}" @click="setZone('coach')">🎓 COACH</button>
     <button :class="{active: zone==='production'}" @click="setZone('production')">📡 PRODUCCIÓN</button>
     <button :class="{active: zone==='help'}" @click="setZone('help')">❓ HELP</button>
+    <button :class="{active: zone==='settings'}" @click="setZone('settings')">⚙ SETTINGS</button>
   </nav>
   <nav class="switcher" title="bifurcación de datos: cash vs torneo (DBs separadas)">
     <button :class="{active: game==='cash'}" @click="setGameCtx('cash')">♠ CASH</button>
@@ -283,6 +284,51 @@
       </div>
     </div>
 
+  </div>
+</main>
+
+<!-- ════════════ SETTINGS ════════════ -->
+<main class="view" x-show="zone==='settings'">
+  <div class="grid">
+    <div class="card col-6">
+      <h3>🔑 API keys de proveedores LLM <span class="sub">se guardan en .env · nunca se muestran</span></h3>
+      <div class="body">
+        <template x-for="pr in settingsProviders" :key="pr.id">
+          <div class="row" style="gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+            <b style="width:115px" x-text="pr.label"></b>
+            <span class="pill" :class="(settings.keys && settings.keys[pr.id] && settings.keys[pr.id].configured) ? 'green' : 'amber'"
+                  x-text="(settings.keys && settings.keys[pr.id] && settings.keys[pr.id].configured) ? '✓ configurada' : '✗ falta'"></span>
+            <input type="password" autocomplete="off" :placeholder="'API key de '+pr.label" x-model="keyInput[pr.id]" style="flex:1;min-width:170px">
+            <input x-show="pr.needBase" placeholder="base URL" x-model="baseInput[pr.id]" style="width:190px">
+            <button class="btn sm" @click="saveKey(pr.id)">Guardar</button>
+          </div>
+        </template>
+        <div class="dim" style="font-size:11px;margin-top:4px">MiniMax usa <code>OPENAI_API_KEY</code>. Xiaomi/MiMo necesita también su <b>base URL</b>. La key no se devuelve nunca: solo el estado.</div>
+        <div x-show="settingsMsg" class="pill green" style="margin-top:8px" x-text="settingsMsg"></div>
+      </div>
+    </div>
+    <div class="card col-6">
+      <h3>🧠 Modelo LLM <span class="sub">el motor del bot</span></h3>
+      <div class="body">
+        <label style="display:block;margin-bottom:4px"><b>Playground en vivo</b></label>
+        <select x-model="liveModel" style="width:100%">
+          <template x-for="m in (settings.presets||[])" :key="'l'+m.id">
+            <option :value="m.id" :disabled="!providerReady(m.provider)" x-text="m.label + (providerReady(m.provider)?'':' — sin key')"></option>
+          </template>
+        </select>
+        <div class="dim" style="font-size:11px;margin:4px 0 8px">Debe ser RÁPIDO (~&lt;20s) o cae a heurístico en el reloj del Playground (~28s). M2 ≈9s ✓; M3/R1 ≈30s ✗.</div>
+        <button class="btn sm suggested" @click="applyLive()">Aplicar al Playground (re-despliega)</button>
+        <hr style="margin:14px 0;border:0;border-top:1px solid var(--border)">
+        <label style="display:block;margin-bottom:4px"><b>Default global</b> <span class="dim">(Coach · nuevos agentes)</span></label>
+        <select x-model="defModel" style="width:100%">
+          <template x-for="m in (settings.presets||[])" :key="'d'+m.id">
+            <option :value="m.id" :disabled="!providerReady(m.provider)" x-text="m.label + (providerReady(m.provider)?'':' — sin key')"></option>
+          </template>
+        </select>
+        <button class="btn sm" style="margin-top:8px" @click="saveDefault()">Guardar default</button>
+        <div x-show="settingsMsg2" class="pill green" style="margin-top:8px" x-text="settingsMsg2"></div>
+      </div>
+    </div>
   </div>
 </main>
 
