@@ -64,6 +64,18 @@ function heatGrid(classes){
   }
   return g;
 }
+// rango de showdown de un rival: classes[hand_class] = nº de veces mostrada
+function showdownGrid(classes){
+  const mx=Math.max(1,...Object.values(classes||{}));
+  let g="";
+  for(let i=0;i<13;i++)for(let j=0;j<13;j++){
+    const cl=combo(i,j), n=(classes&&classes[cl])||0;
+    const L=n>0?(58-32*n/mx):(getCSSdark()?14:96), bg=n>0?`hsl(145 58% ${L}%)`:"var(--bg)";
+    const fg=(n>0&&n/mx>0.5)?"#fff":"var(--dim)";
+    g+=`<div class="heat" title="${cl}${n?(" · mostrada "+n+"x"):""}" style="background:${bg};color:${fg}">${cl}</div>`;
+  }
+  return g;
+}
 function getCSSdark(){return window.matchMedia&&window.matchMedia("(prefers-color-scheme: dark)").matches;}
 
 /* Rejilla 13×13 clicable para el builder. selected = Set de combos. */

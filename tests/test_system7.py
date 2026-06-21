@@ -34,6 +34,10 @@ def test_strength_taxonomy():
     assert d._strength(["5s", "4d"], ["Ah", "Kc", "9d"], "dry") == "AIR"   # nothing
     # set degrades to MM on extreme board
     assert d._strength(["7h", "7d"], ["7c", "8s", "9s"], "extreme") == "MM"
+    # two pair on a PAIRED board: underpair riding the board pair is a bluff-catcher (no commit), real two pair stays strong
+    assert d._strength(["9h", "9d"], ["5d", "Jh", "Ks", "Kc"], "semi") == "MM"   # 99 on 5JKK (underpair) -> MM, not jam
+    assert d._strength(["Qs", "Qd"], ["Ks", "Kc", "Jh", "5d"], "semi") == "MF"   # QQ over the board on KKJ5 -> MF
+    assert d._strength(["Ad", "Jc"], ["Ks", "Kc", "Jh", "5d"], "semi") == "MF"   # AJ = top two (KK+JJ) on paired board -> MF
 
 
 def test_texture_grades():

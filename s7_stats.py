@@ -17,7 +17,7 @@ _DECISION_COLS = (
     "ts", "table_id", "hand_key", "street", "pos", "ip", "hole", "hand_class",
     "board", "texture", "strength", "spr", "pot", "call_chips", "pot_odds",
     "adj_outs", "n_villains", "archetype", "engine", "action", "amount",
-    "voluntary", "preflop_raise", "run_label", "m3_log", "model", "agent_id",
+    "voluntary", "preflop_raise", "run_label", "m3_log", "model", "agent_id", "competition_id",
 )
 
 
@@ -41,7 +41,7 @@ def init():
             spr REAL, pot INTEGER, call_chips INTEGER, pot_odds REAL, adj_outs INTEGER,
             n_villains INTEGER, archetype TEXT, engine TEXT, action TEXT, amount INTEGER,
             voluntary INTEGER, preflop_raise INTEGER, run_label TEXT, m3_log TEXT, model TEXT,
-            agent_id TEXT)""")
+            agent_id TEXT, competition_id TEXT)""")
         # migrate older DBs that predate run_label / m3_log / model
         cols = {r[1] for r in c.execute("PRAGMA table_info(decisions)")}
         if "run_label" not in cols:
@@ -52,7 +52,10 @@ def init():
             c.execute("ALTER TABLE decisions ADD COLUMN model TEXT")
         if "agent_id" not in cols:
             c.execute("ALTER TABLE decisions ADD COLUMN agent_id TEXT")
+        if "competition_id" not in cols:
+            c.execute("ALTER TABLE decisions ADD COLUMN competition_id TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS idx_decisions_agent ON decisions(agent_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_decisions_comp ON decisions(competition_id)")
         c.execute("""CREATE TABLE IF NOT EXISTS bankroll(
             ts REAL, table_chips INTEGER, hands INTEGER, rebuys INTEGER, note TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS runs(
@@ -67,7 +70,9 @@ def init():
             c.execute("ALTER TABLE hand_events ADD COLUMN seats TEXT")
         c.execute("""CREATE TABLE IF NOT EXISTS hand_results(
             table_id TEXT PRIMARY KEY, ts REAL, board TEXT, winners TEXT, seats_shown TEXT,
-            payout INTEGER, chip_delta INTEGER, our_hand TEXT, replay_url TEXT)""")
+            payout INTEGER, chip_delta INTEGER, our_hand TEXT, replay_url TEXT, pot INTEGER)""")
+        if "pot" not in {r[1] for r in c.execute("PRAGMA table_info(hand_results)")}:
+            c.execute("ALTER TABLE hand_results ADD COLUMN pot INTEGER")
         if "replay_url" not in {r[1] for r in c.execute("PRAGMA table_info(hand_results)")}:
             c.execute("ALTER TABLE hand_results ADD COLUMN replay_url TEXT")
         c.execute("""CREATE TABLE IF NOT EXISTS agent_stats(
@@ -152,19 +157,31 @@ def log_hand_events(hand_key, seat, hole, board, events, seats=None):
                    json.dumps(ev, default=str), len(ev), seats_json))
 
 
-def log_hand_result(table_id, board, winners, seats_shown, payout, chip_delta, our_hand="", replay_url=""):
+def log_hand_result(table_id, board, winners, seats_shown, payout, chip_delta, our_hand="", replay_url="", pot=0):
     """Settled-hand result from /texas/recent-tables (+replays): winners, revealed cards, official replay url."""
     if not table_id:
         return
     with _conn() as c:
-        if not replay_url:                       # don't clobber a previously-stored url with ""
-            prev = c.execute("select replay_url from hand_results where table_id=?", (str(table_id),)).fetchone()
-            if prev and prev[0]:
-                replay_url = prev[0]
-        c.execute("insert or replace into hand_results values(?,?,?,?,?,?,?,?,?)",
-                  (str(table_id), time.time(), board or "",
-                   json.dumps(winners or [], default=str), json.dumps(seats_shown or [], default=str),
-                   payout, chip_delta, our_hand or "", replay_url or ""))
+        # run_pvp y el tracker re-escriben la misma table_id (insert or replace): NO pisar datos buenos
+        # con vacíos/0 cuando una mano sale de la ventana de replays (antes solo se protegía replay_url).
+        prev = c.execute("select board, winners, seats_shown, payout, chip_delta, our_hand, replay_url, pot "
+                         "from hand_results where table_id=?", (str(table_id),)).fetchone()
+        if prev:
+            board = board or prev[0]
+            payout = payout or prev[3]
+            chip_delta = chip_delta if chip_delta else prev[4]
+            our_hand = our_hand or prev[5]
+            replay_url = replay_url or prev[6]
+            pot = pot or prev[7]
+            if not winners:
+                winners = prev[1]
+            if not seats_shown:
+                seats_shown = prev[2]
+        wj = winners if isinstance(winners, str) else json.dumps(winners or [], default=str)
+        sj = seats_shown if isinstance(seats_shown, str) else json.dumps(seats_shown or [], default=str)
+        c.execute("insert or replace into hand_results values(?,?,?,?,?,?,?,?,?,?)",
+                  (str(table_id), time.time(), board or "", wj, sj,
+                   payout or 0, chip_delta or 0, our_hand or "", replay_url or "", int(pot or 0)))
 
 
 def log_agent_stats(agent_id, name, st):

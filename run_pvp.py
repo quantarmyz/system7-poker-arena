@@ -157,6 +157,7 @@ def _features(table, action, research):
         "m3_log": json.dumps(action["m3"], default=str) if action.get("m3") else None,
         "model": (action.get("m3") or {}).get("model"),
         "agent_id": _agent_id(),
+        "competition_id": os.environ.get("ARENA_COMPETITION_ID", ""),
     }
 
 
@@ -244,6 +245,10 @@ def main():
             os.environ.get("S7_PVP_WORKERS", "4"), MARGIN, os.environ.get("S7_LLM_MIN_DEADLINE", "30"),
             os.environ.get("S7_LLM_TIMEOUT", "90"), os.environ.get("S7_MAX_TOKENS", "3000")))
 
+    allin_ctx = {}              # tid -> (hole, board, aporte) cuando hero queda all-in → para la EV ajustada
+    ev_state = {"adj": 0.0}     # ajuste acumulado (EV − real) de los all-in a showdown
+    _meta_flag = {}
+
     def _submit_action(table, action, research):
         """Log the decision + POST /texas/action. Returns False on auth error (caller should stop)."""
         tid = table.get("tableId")
@@ -252,6 +257,23 @@ def main():
         except Exception:
             pass
         _capture_opp(table)                 # archivo de manos/acciones de rivales (HUD)
+        try:                                # EV all-in: si hero compromete su stack, guarda hole/board/aporte para ajustar la varianza
+            _se = table.get("selfSeatNumber")
+            _me = next((s for s in (table.get("seats") or []) if s.get("seatNumber") == _se), {})
+            _stk = int(_me.get("stackChips") or 0)
+            _cm = int(_me.get("totalCommittedChips") or 0)
+            _cb = int(_me.get("currentBetChips") or 0)
+            _cc = int((table.get("allowedActions") or {}).get("callChips") or 0)
+            _ac = action.get("action"); _am = int(action.get("amount") or 0)
+            if _stk > 0 and ((_ac == "all-in") or (_ac == "call" and _cc >= _stk)
+                             or (_ac in ("bet", "raise") and _am - _cb >= _stk)):
+                allin_ctx[tid] = (list(_me.get("holeCards") or []), list(table.get("boardCards") or []), _cm + _stk)
+            if not _meta_flag.get("bb"):    # captura la ciega grande una vez (para bb/100 en vivo)
+                _bb = table.get("bigBlindChips") or table.get("bigBlind") or (table.get("blinds") or {}).get("big")
+                if _bb:
+                    s7_stats.set_meta("big_blind", int(_bb)); _meta_flag["bb"] = True
+        except Exception:
+            pass
         payload = {"tableId": tid, "action": action.get("action"),
                    "message": action.get("message", ""), "reasoning": action.get("reasoning", "")}
         if action.get("amount") is not None and action.get("action") in ("bet", "raise", "all-in"):
@@ -436,20 +458,32 @@ def main():
             try:
                 s7_stats.log_bankroll(last_stack, hands_done, rebuys)
                 _rl = os.environ.get("S7_RUN_LABEL")
-                if _rl and last_stack is not None:
-                    _net = last_stack - 1000 * (1 + rebuys)         # neto vs bankroll inicial + rebuys
-                    s7_stats.log_equity(_rl, hands_done, _net, _net)
-                _aid = _agent_id()                                  # captura replay_url → reproductor oficial
+                _aid = _agent_id()                                  # captura replay_url + chipDelta por mano
                 if _aid:
                     _rep = c.get(f"/agent/{_aid}/replays?limit=50")
                     _rows = _rep if isinstance(_rep, list) else ((_rep or {}).get("data") or [])
                     for _r in (_rows or []):
                         _tid = _r.get("tableId") or _r.get("handId")
                         _url = _r.get("replayUrl") or _r.get("url")
+                        _cd = _r.get("chipDelta")
+                        if _tid and _tid in allin_ctx and _cd is not None:   # EV all-in: suaviza la varianza del flip
+                            _hl, _bd, _C = allin_ctx.pop(_tid)
+                            if _C > 0 and abs(_cd) >= 0.5 * _C:              # la villana PAGÓ el all-in (showdown), no fold
+                                try:                                        # EV = aporte×(2·equity−1); ajuste = EV − real
+                                    _eq = H._equity(_hl, _bd, 1, deadline_s=4.0)
+                                    ev_state["adj"] += _C * (2.0 * _eq - 1.0) - _cd
+                                except Exception:
+                                    pass
                         if _tid and _url:
                             _wh = _r.get("winnerHandle") or _r.get("winner")
                             s7_stats.log_hand_result(str(_tid), "", ([{"agentName": _wh}] if _wh else []),
-                                                     [], 0, _r.get("chipDelta"), "", _url)
+                                                     [], 0, _cd, "", _url)
+                    if len(allin_ctx) > 300:                                 # poda manos que nunca casaron un replay
+                        for _k in list(allin_ctx)[:-150]:
+                            allin_ctx.pop(_k, None)
+                if _rl and last_stack is not None:
+                    _net = last_stack - 1000 * (1 + rebuys)         # neto REAL vs bankroll inicial + rebuys
+                    s7_stats.log_equity(_rl, hands_done, _net, _net + int(round(ev_state["adj"])))  # raw=real, adj=EV
             except Exception:
                 pass
             if ASYNC:

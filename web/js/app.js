@@ -14,9 +14,9 @@ function app() {
     agents: [], strategies: [], evalMaxc: 3,
     evalForm: { agent: "", total: 6, maxc: 2, group: "" }, evalMsg: "", runs: [], groups: [],
     builder: null, report: null, task: "", taskData: null, taskLog: "",
-    coachForm: { agent: "", window: "all" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
-    prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "eval" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
-    modalHand: null, step: 0, embed: true, eqOpt: { ev: true, off: {} },
+    coachForm: { agent: "", window: "" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
+    prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
+    modalHand: null, modalOpp: null, step: 0, embed: true, eqOpt: { ev: true, off: {} },
     settings: {}, keyInput: {}, baseInput: {}, liveModel: "", defModel: "", settingsMsg: "", settingsMsg2: "",
     settingsProviders: [{ id: "minimax", label: "MiniMax" }, { id: "xiaomi", label: "Xiaomi MiMo", needBase: true }, { id: "openrouter", label: "OpenRouter" }, { id: "deepseek", label: "DeepSeek" }],
 
@@ -25,6 +25,7 @@ function app() {
       setInterval(() => this.tick(), 4000);
       setInterval(() => { if (this.zone === "lab") { this.loadRuns(); this.loadGroups(); if (this.task) this.loadTask(); } }, 15000);
       setInterval(() => { if (this.zone === "production" && ((this.prod || {}).active || []).length) { this.loadHands(); this.loadProdLog(); } }, 2000);   // manos + log casi en vivo
+      setInterval(() => { if (this.zone === "production") { this.loadAccount(); this.loadProd(); this.loadRank(); this.loadSession(); } }, 30000);   // posición del leaderboard + stats al día (sigue el ranking en vivo; suave con el rate-limit)
     },
     setGameCtx(g) { this.game = g; CTXGAME = g; this.builder = null; this.report = null; this.setZone(this.zone); },
 
@@ -252,7 +253,8 @@ function app() {
       const panel = d.vs_panel ? `<div style="margin-bottom:8px">vs panel near-GTO: <b class="${(d.vs_panel.bb100 || 0) >= 0 ? "pos" : "neg"}">${(d.vs_panel.bb100 || 0) >= 0 ? "+" : ""}${d.vs_panel.bb100} bb/100</b> <span class="dim">(${d.vs_panel.runs} runs)</span></div>` : "";
       const vsopt = (d.vs_opt || []).map(o => `<tr><td><b>${esc(o.k)}</b></td><td>${esc(o.you)}</td><td class="dim">${esc(o.target)}</td><td class="${vcol(o.verdict)}" style="text-align:center;font-weight:700">${esc(o.verdict)}</td><td class="dim">${esc(o.note)}</td></tr>`).join("");
       const adv = (d.advice || []).map(a => `<div style="padding:2px 0">▷ ${esc(a)}</div>`).join("");
-      return `${panel}<table class="list"><thead><tr><th>métrica</th><th>tú</th><th>óptimo</th><th>✓</th><th>nota</th></tr></thead><tbody>${vsopt}</tbody></table>
+      const stale = d.stale ? `<div class="pill amber" style="display:block;margin-bottom:8px;padding:7px 11px;white-space:normal;line-height:1.45">⚠ Solo <b>${d.since_change}</b> manos desde el último cambio de estrategia — este diagnóstico refleja sobre todo la estrategia <b>anterior</b>. Pon «últimas ${d.since_change}» en la ventana para ver solo el juego actual, o deja acumular más manos.</div>` : "";
+      return stale + `${panel}<table class="list"><thead><tr><th>métrica</th><th>tú</th><th>óptimo</th><th>✓</th><th>nota</th></tr></thead><tbody>${vsopt}</tbody></table>
         <div style="margin-top:10px">${adv}</div>`;
     },
     coachLLM() {
@@ -282,7 +284,7 @@ function app() {
       const d = await jget("/api/run/log?unit=" + encodeURIComponent(a.unit) + "&n=80");
       this.prodLog = d.log || d.error || "";
     },
-    async loadCompetitions() { const d = await jget("/api/production/competitions"); this.prodComps = d.competitions || []; },
+    async loadCompetitions() { const d = await jget("/api/production/competitions"); this.prodComps = d.competitions || []; if (this.prodComps.length && !this.prodComps.find(c => c.id === this.deployForm.competition)) this.deployForm.competition = this.prodComps[0].id; },
     async loadRank() { const d = await jget("/api/rank"); this.rank = d.agents || []; },
     async loadAccount() { this.account = null; this.account = await jget("/api/production/account"); },
     renderAccount() {
@@ -298,7 +300,7 @@ function app() {
         <td class="num">${e.score != null ? e.score : "—"}</td></tr>`).join("");
       return head + `<table class="list" style="margin-top:8px"><thead><tr><th>evento</th><th class="num">posición</th><th class="num">score</th></tr></thead><tbody>${evs}</tbody></table>`;
     },
-    async loadSession() { this.prodSession = await jget("/api/production/session?label=" + encodeURIComponent(this.prodSel || "")); },
+    async loadSession() { this.prodSession = await jget("/api/production/session?label="); },   // siempre unificado (temporada actual, todos los deploys)
     renderProdControl() {
       const p = this.prod || {};
       const act = (p.active || []).map(a => `<div class="row" style="margin:4px 0"><span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>${a.continuous ? ` <span class="pill amber">continuo · la cola espera</span>` : ""}
@@ -333,10 +335,10 @@ function app() {
       if (!d) return '<div class="empty">cargando…</div>';
       if (d.error) return `<div class="neg">${esc(d.error)}</div>`;
       const kpi = (l, v) => `<div class="kpi" style="text-align:left"><div class="l">${l}</div><div class="v" style="font-size:17px">${v}</div></div>`;
-      const tag = this.prodSel ? `<span class="pill accent">solo «${esc(this.prodSelName || this.prodSel)}»</span>` : '<span class="dim">sesión global · todos los agentes</span>';
+      const tag = '<span class="dim">temporada actual · todos los deploys unificados</span>';
       const stats = `<div class="row" style="gap:14px;align-items:center;margin-bottom:6px">${tag}<span class="spacer"></span>
         ${kpi("manos", (d.hands || 0).toLocaleString())}${kpi("decisiones", (d.decisions || 0).toLocaleString())}${kpi("M3 %", (d.m3pct || 0) + "%")}
-        ${kpi("bb/100", d.agg && d.agg.mean != null ? (d.agg.mean >= 0 ? "+" : "") + d.agg.mean : "—")}</div>`;
+        ${kpi("bb/100 REAL", d.agg && d.agg.mean != null ? (d.agg.mean >= 0 ? "+" : "") + d.agg.mean : "—")}${kpi("bb/100 EV", d.agg && d.agg.adj != null ? (d.agg.adj >= 0 ? "+" : "") + d.agg.adj : "—")}</div>`;
       const posrow = `<div class="dim" style="margin-top:6px">VPIP / PFR por posición</div><div>${(d.bypos || []).map(p => `<span style="margin-right:10px">${p.pos} <b>${p.vpip}%</b>/<b>${p.pfr}%</b> <span class="dim">n${p.n}</span></span>`).join("") || '<span class="dim">—</span>'}</div>`;
       const grid = `<div class="dim">preflop · manos que jugamos (VPIP, 13×13)</div><div style="display:grid;grid-template-columns:repeat(13,1fr);gap:1px;max-width:460px;margin-top:4px">${heatGrid(d.classes || {})}</div>`;
       const post = `<div class="dim">decisiones postflop por calle</div>${postflopBars(d.postflop || {})}`;
@@ -344,8 +346,10 @@ function app() {
     },
     onProdClick(e) {
       const s = e.target.closest("[data-stopprod]"), q = e.target.closest("[data-dequeue]"), c = e.target.closest("[data-claim]"),
-        sel = e.target.closest("[data-sel]"), all = e.target.closest("[data-selall]"), rd = e.target.closest("[data-rankdel]"), k = e.target.closest("[data-key]");
-      if (s) this.stopProd(s.dataset.stopprod);
+        sel = e.target.closest("[data-sel]"), all = e.target.closest("[data-selall]"), rd = e.target.closest("[data-rankdel]"), k = e.target.closest("[data-key]"),
+        op = e.target.closest("[data-opp]");
+      if (op) this.openOpponent(op.dataset.opp);
+      else if (s) this.stopProd(s.dataset.stopprod);
       else if (q) this.dequeue(+q.dataset.dequeue);
       else if (rd) this.rankDelete(rd.dataset.rankdel);
       else if (c) this.claim(c.dataset.claim);
@@ -370,32 +374,26 @@ function app() {
     async claim(label) { const m = document.getElementById("claim-msg") || document.getElementById("prod-msg"); if (m) m.textContent = "obteniendo enlace de claim…";
       const d = await jget("/api/claim?label=" + encodeURIComponent(label)); if (m) m.innerHTML = d.claim_url ? `🏆 <a href="${esc(d.claim_url)}" target="_blank" rel="noopener">${esc(d.claim_url)}</a>` : `<span class="neg">${esc(d.error || "sin claim_url")}</span>`; },
     renderEquity() {
-      let eq = (this.state || {}).equity || {}, hdr = "";
-      if (this.prodSel) {
-        const k = Object.keys(eq).find(x => x === this.prodSel || x.indexOf(this.prodSel) === 0);
-        eq = k ? { [k]: eq[k] } : {};
-        hdr = `<div class="row" style="margin-bottom:4px"><span class="pill accent">solo «${esc(this.prodSelName || this.prodSel)}»</span> <button class="btn sm flat" data-selall="1">ver todos</button></div>`;
-      }
-      return hdr + equityChart(eq, this.eqOpt);
+      const st = this.state || {}, live = st.live_equity || {};
+      const eq = Object.keys(live).length ? live : (st.equity || {});   // S4 unificado (todos los deploys); si no hay, histórico
+      return equityChart(eq, this.eqOpt);
     },
 
     async loadHands() { const d = await jget("/api/hands"); this.hands = d.hands || []; },
     renderHands() {
       const f = (this.handFilter || "").toLowerCase().trim();
-      let rows = this.hands;
-      if (this.prodSel) rows = rows.filter(h => (h.label || "") === this.prodSel || (h.label || "").indexOf(this.prodSel) === 0);
+      let rows = this.hands;   // todas las manos de la temporada actual (S4), unificadas — sin filtro por run/deploy
       if (this.llmOnly) rows = rows.filter(h => h.m3 > 0);
       rows = rows.filter(h => !f || (h.pos || "").toLowerCase().includes(f) || (h.hole || "").toLowerCase().includes(f)
         || (h.hclass || "").toLowerCase().includes(f) || (h.reached || "").toLowerCase().includes(f) || (h.label || "").toLowerCase().includes(f)
         || (f === "win" && h.won) || (f === "m3" && h.m3 > 0)).slice(0, 250);
-      const hdr = this.prodSel ? `<div class="row" style="margin-bottom:6px"><span class="pill accent">solo «${esc(this.prodSelName || this.prodSel)}»</span> <button class="btn sm flat" data-selall="1">ver todos</button></div>` : "";
-      if (!rows.length) return hdr + `<div class="empty">sin manos${this.prodSel ? " de este agente todavía" : ""}</div>`;
-      return hdr + `<table class="list"><thead><tr><th>hora</th><th>arm</th><th>modo</th><th>pos</th><th>mano</th><th>board</th><th>flop</th><th>turn</th><th>river</th><th>fold</th><th>calle</th><th class="num">bote</th><th class="num">result</th></tr></thead><tbody>${rows.map(h => `<tr class="clk" data-key="${encodeURIComponent(h.key)}"><td class="dim">${tt(h.ts)}</td><td>${esc(h.label || "·")}</td><td>${h.m3 > 0 ? `<b class="pos" title="click en la mano → ver mensaje enviado y respuesta de la LLM" style="cursor:pointer;text-decoration:underline dotted">LLM</b>${h.m3 > 1 ? ` <span class="dim">${h.m3}</span>` : ""}` : '<span class="dim">HEUR</span>'}</td><td>${esc(h.pos || "")}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim">${esc(h.act_flop || "·")}</td><td class="dim">${esc(h.act_turn || "·")}</td><td class="dim">${esc(h.act_river || "·")}</td><td>${!h.fold ? '<span class="pos">—</span>' : (h.fold === "preflop" ? '<span class="dim">PF</span>' : '<span class="pill amber">' + esc(h.fold) + '</span>')}</td><td>${esc(h.reached || "")}</td><td class="num">${h.pot}</td><td class="num">${h.delta == null ? "·" : `<b class="${h.delta >= 0 ? "pos" : "neg"}">${h.delta >= 0 ? "+" : ""}${h.delta}</b>`}</td></tr>`).join("")}</tbody></table>`;
+      if (!rows.length) return `<div class="empty">sin manos en esta temporada todavía</div>`;
+      return `<table class="list"><thead><tr><th>hora</th><th>arm</th><th>modo</th><th>pos</th><th>mano</th><th>board</th><th>flop</th><th>turn</th><th>river</th><th>fold</th><th>calle</th><th class="num">bote</th><th class="num">result</th></tr></thead><tbody>${rows.map(h => `<tr class="clk" data-key="${encodeURIComponent(h.key)}"><td class="dim">${tt(h.ts)}</td><td>${esc(h.label || "·")}</td><td>${h.m3 > 0 ? `<b class="pos" title="click en la mano → ver mensaje enviado y respuesta de la LLM" style="cursor:pointer;text-decoration:underline dotted">LLM</b>${h.m3 > 1 ? ` <span class="dim">${h.m3}</span>` : ""}` : '<span class="dim">HEUR</span>'}</td><td>${esc(h.pos || "")}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim">${esc(h.act_flop || "·")}</td><td class="dim">${esc(h.act_turn || "·")}</td><td class="dim">${esc(h.act_river || "·")}</td><td>${!h.fold ? '<span class="pos">—</span>' : (h.fold === "preflop" ? '<span class="dim">PF</span>' : '<span class="pill amber">' + esc(h.fold) + '</span>')}</td><td>${esc(h.reached || "")}</td><td class="num">${h.pot}</td><td class="num">${h.delta == null ? "·" : `<b class="${h.delta >= 0 ? "pos" : "neg"}">${h.delta >= 0 ? "+" : ""}${h.delta}</b>`}</td></tr>`).join("")}</tbody></table>`;
     },
     async loadOpponents() { const d = await jget("/api/tracker/opponents"); this.opponents = d.opponents || []; },
     renderOpponents() {
       if (!this.opponents.length) return '<div class="empty">sin rivales aún — se llena solo durante el juego (HUD del Arena)</div>';
-      return `<table class="list"><thead><tr><th>rival</th><th>estilo</th><th class="num">N</th><th class="num">VPIP</th><th class="num">PFR</th><th class="num">AF</th><th class="num">WTSD</th><th class="num">vistas</th></tr></thead><tbody>${this.opponents.map(o => `<tr><td><b>${esc(o.name || o.agent_id)}</b></td><td>${o.adapting ? `<span class="pill green">${esc(o.archetype)} · adaptando</span>` : `<span class="dim">${o.archetype === "UNKNOWN" ? "&lt;500 manos" : esc(o.archetype || "?")}</span>`}</td><td class="num">${o.n == null ? "—" : Number(o.n).toLocaleString()}</td><td class="num">${pct(o.vpip)}</td><td class="num">${pct(o.pfr)}</td><td class="num">${o.af == null ? "—" : (+o.af).toFixed(1)}</td><td class="num">${pct(o.wtsd)}</td><td class="num">${o.shown_hands || 0}</td></tr>`).join("")}</tbody></table>`;
+      return `<div class="dim" style="font-size:11px;margin-bottom:5px">clic en un rival → su ficha (manos mostradas + stats)</div><table class="list"><thead><tr><th>rival</th><th>estilo</th><th class="num">N</th><th class="num">VPIP</th><th class="num">PFR</th><th class="num">AF</th><th class="num">WTSD</th><th class="num">vistas</th></tr></thead><tbody>${this.opponents.map(o => `<tr class="clk" data-opp="${esc(o.agent_id)}" style="cursor:pointer"><td><b>${esc(o.name || o.agent_id)}</b></td><td>${o.adapting ? `<span class="pill green">${esc(o.archetype)} · adaptando</span>` : `<span class="dim">${o.archetype === "UNKNOWN" ? "&lt;500 manos" : esc(o.archetype || "?")}</span>`}</td><td class="num">${o.n == null ? "—" : Number(o.n).toLocaleString()}</td><td class="num">${pct(o.vpip)}</td><td class="num">${pct(o.pfr)}</td><td class="num">${o.af == null ? "—" : (+o.af).toFixed(1)}</td><td class="num">${pct(o.wtsd)}</td><td class="num">${o.shown_hands || 0}</td></tr>`).join("")}</tbody></table>`;
     },
     async harvest() { await jpost("/api/tracker/harvest", {}); setTimeout(() => this.loadOpponents(), 1500); },
     async loadSettings() {
@@ -451,5 +449,25 @@ function app() {
     onModalClick(e) { const a = e.target.closest("[data-act]"); if (!a) return; const act = a.dataset.act;
       if (act === "close") this.closeHand(); else if (act === "embed") this.embed = !this.embed;
       else if (act === "prev") this.step = Math.max(0, this.step - 1); else if (act === "next") this.step++; },
+    async openOpponent(id) { if (!id) return; this.modalOpp = { loading: true }; this.modalOpp = await jget("/api/opponent?id=" + encodeURIComponent(id)); },
+    closeOpp() { this.modalOpp = null; },
+    onOppClick(e) { const a = e.target.closest("[data-oppact]"); if (a && a.dataset.oppact === "close") this.closeOpp(); },
+    renderOppModal() {
+      const o = this.modalOpp; if (!o) return "";
+      if (o.loading) return '<div class="mh"><b>cargando…</b></div>';
+      if (o.error) return `<div class="mh"><b>error</b> <span class="spacer"></span><button class="btn sm" data-oppact="close">✕</button></div><div class="mb neg">${esc(o.error)}</div>`;
+      const p = o.profile || {}, P = x => x == null ? 0 : Math.round(Math.abs(x) <= 1 ? x * 100 : x);
+      const head = `<div class="mh"><b>${esc(p.name || "rival")}</b> <span class="pill ${(p.archetype && p.archetype !== "UNKNOWN") ? "green" : "dim"}">${esc(p.archetype || "?")}</span>
+        <span class="dim" style="font-size:12px">N=${p.n == null ? "—" : Number(p.n).toLocaleString()} · ${o.showdowns || 0} showdowns vistos${o.sd_winrate != null ? " · " + o.sd_winrate + "% ganados" : ""}</span>
+        <span class="spacer"></span><button class="btn sm" data-oppact="close">✕</button></div>`;
+      const bars = `<div style="max-width:440px;margin:8px 0">${meter("VPIP", P(p.vpip), 100, "%")}${meter("PFR", P(p.pfr), 100, "%")}${meter("AF", p.af == null ? 0 : +(+p.af).toFixed(1), 8, "")}${meter("WTSD", P(p.wtsd), 100, "%")}${meter("WSD", P(p.wsd), 100, "%")}</div>`;
+      const grid = (o.grid && Object.keys(o.grid).length)
+        ? `<div class="dim" style="margin-top:6px">rango de showdown (manos que ha enseñado)</div><div style="display:grid;grid-template-columns:repeat(13,1fr);gap:1px;max-width:460px;margin-top:4px">${showdownGrid(o.grid)}</div>`
+        : "";
+      const hands = (o.hands || []).length
+        ? `<div class="dim" style="margin-top:10px">manos suyas en mesas que jugamos</div><table class="list" style="margin-top:4px"><thead><tr><th>hora</th><th>mano</th><th>board</th><th>jugada</th><th>res</th><th></th></tr></thead><tbody>${o.hands.map(h => `<tr><td class="dim">${tt(h.ts)}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim">${esc(h.hand_name || "")}</td><td>${h.won ? '<span class="pos">ganó</span>' : '<span class="dim">—</span>'}</td><td>${h.replay_url ? `<a href="${esc(h.replay_url)}" target="_blank" rel="noopener">▶</a>` : ""}</td></tr>`).join("")}</tbody></table>`
+        : '<div class="dim" style="margin-top:10px">aún no le hemos visto cartas en showdown</div>';
+      return head + `<div class="mb">${bars}${grid}${hands}</div>`;
+    },
   };
 }

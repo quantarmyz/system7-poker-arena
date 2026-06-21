@@ -91,7 +91,7 @@
           <select x-model="coachForm.agent" @change="loadCoach()"><option value="">(todos)</option><template x-for="a in agents" :key="a.name"><option x-text="a.name"></option></template></select>
         </label>
         <label class="field" style="flex-direction:row;align-items:center;gap:6px">ventana
-          <select x-model="coachForm.window" @change="loadCoach()"><option value="all">todas</option><option value="10000">últimas 10k</option></select>
+          <input type="number" min="0" step="100" x-model="coachForm.window" @change="loadCoach()" placeholder="todas" style="width:100px" title="nº de últimas manos a analizar — vacío = todas"><span class="dim" style="font-size:11px;margin-left:4px">últimas N (vacío=todas)</span>
         </label>
       </h3>
       <div class="body" x-html="renderCoach()"></div>
@@ -121,6 +121,15 @@
 <!-- ════════════ PRODUCCIÓN ════════════ -->
 <main class="view" x-show="zone==='production'">
   <div class="grid">
+    <!-- 1) Tu agente y dónde estás -->
+    <div class="card col-12">
+      <h3>🏅 Mi agente (cuenta) <span class="sub">tu agente reclamado · posición por evento</span>
+        <span class="spacer"></span>
+        <button class="btn sm" @click="loadAccount()">↻ actualizar</button>
+      </h3>
+      <div class="body" x-html="renderAccount()"></div>
+    </div>
+    <!-- 2) Desplegar + qué está jugando ahora -->
     <div class="card col-6">
       <h3>Jugar evento <span class="sub">agente + evento · 1 activo + cola</span></h3>
       <div class="body">
@@ -137,23 +146,25 @@
       </div>
     </div>
     <div class="card col-6">
-      <h3>🏆 Ranking <span class="sub">mejores agentes · reclamar</span></h3>
-      <div class="body tight scroll" x-html="renderRank()" @click="onProdClick($event)"></div>
-    </div>
-    <div class="card col-12">
-      <h3>🏅 Mi agente (cuenta) <span class="sub">tu agente reclamado · posición por evento</span>
-        <span class="spacer"></span>
-        <button class="btn sm" @click="loadAccount()">↻ actualizar</button>
-      </h3>
-      <div class="body" x-html="renderAccount()"></div>
-    </div>
-    <div class="card col-12">
       <h3>🟢 En vivo <span class="sub">agentes jugando ahora</span></h3>
       <div class="body" x-html="renderLive()" @click="onProdClick($event)"></div>
     </div>
+    <!-- 3) Estado del agente en vivo -->
     <div class="card col-12">
       <h3>📜 Log del agente en vivo <span class="sub">join · manos · timeouts · errores · auto-refresco</span></h3>
       <div class="body"><pre class="log" x-text="prodLog || '(ningún agente activo o sin salida todavía)'"></pre></div>
+    </div>
+    <!-- 4) Análisis: sesión → manos → rivales -->
+    <div class="card col-8">
+      <h3>Sesión en juego <span class="sub">preflop 13×13 · postflop · stats (agente seleccionado o global)</span></h3>
+      <div class="body" x-html="renderSession()" @click="onProdClick($event)"></div>
+    </div>
+    <div class="card col-4">
+      <h3>Equity en vivo <span class="sub">REAL vs EV</span>
+        <span class="spacer"></span>
+        <button class="btn sm flat" @click="eqOpt.ev=!eqOpt.ev" x-text="eqOpt.ev?'ocultar EV':'mostrar EV'"></button>
+      </h3>
+      <div class="body fill" x-html="renderEquity()" @click="onProdClick($event)"></div>
     </div>
     <div class="card col-12">
       <h3>Manos en vivo <span class="sub">clic → reproductor · ▶ repro oficial</span></h3>
@@ -165,23 +176,17 @@
         <div class="scroll" x-html="renderHands()" @click="onProdClick($event)"></div>
       </div>
     </div>
-    <div class="card col-4">
-      <h3>Equity en vivo <span class="sub">REAL vs EV</span>
-        <span class="spacer"></span>
-        <button class="btn sm flat" @click="eqOpt.ev=!eqOpt.ev" x-text="eqOpt.ev?'ocultar EV':'mostrar EV'"></button>
-      </h3>
-      <div class="body fill" x-html="renderEquity()" @click="onProdClick($event)"></div>
-    </div>
-    <div class="card col-8">
-      <h3>Sesión en juego <span class="sub">preflop 13×13 · postflop · stats (agente seleccionado o global)</span></h3>
-      <div class="body" x-html="renderSession()" @click="onProdClick($event)"></div>
-    </div>
     <div class="card col-12">
-      <h3>Rivales <span class="sub">tracker (PokerTracker/HM)</span>
+      <h3>Rivales <span class="sub">tracker (PokerTracker/HM) · clic en un rival = su ficha</span>
         <span class="spacer"></span>
         <button class="btn sm" @click="harvest()">↻ cosechar</button>
       </h3>
-      <div class="body tight scroll" x-html="renderOpponents()"></div>
+      <div class="body tight scroll" x-html="renderOpponents()" @click="onProdClick($event)"></div>
+    </div>
+    <!-- 5) Clasificación general (referencia) -->
+    <div class="card col-12">
+      <h3>🏆 Ranking <span class="sub">mejores agentes · reclamar</span></h3>
+      <div class="body tight scroll" x-html="renderRank()" @click="onProdClick($event)"></div>
     </div>
   </div>
 </main>
@@ -335,6 +340,11 @@
 <!-- modal reproductor -->
 <div class="modal" :class="{open: modalHand}" @click="if($event.target===$el) closeHand()">
   <div class="sheet wide" x-html="renderHandModal()" @click="onModalClick($event)"></div>
+</div>
+
+<!-- modal ficha de rival -->
+<div class="modal" :class="{open: modalOpp}" @click="if($event.target===$el) closeOpp()">
+  <div class="sheet wide" x-html="renderOppModal()" @click="onOppClick($event)"></div>
 </div>
 
 </body>

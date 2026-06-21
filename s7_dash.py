@@ -175,18 +175,39 @@ def _state():
         seg = [r for r in eqrows if r[0] == lbl]
         # stitch sawtooth: the cumulative counters reset to ~0 on each service restart
         stitched = []
-        bh = braw = badj = 0.0   # base offset = sum of previous segments' ends
-        lh = lraw = ladj = 0.0   # last stitched point
+        bh = 0.0; lh = lraw = ladj = 0.0   # bh = offset SOLO de manos; el neto NO se desplaza
         ph = None
         for (_, h, rw, ad) in seg:
             h = h or 0; rw = rw or 0; ad = ad or 0
-            if ph is not None and h < ph:      # reset -> new segment
-                bh, braw, badj = lh, lraw, ladj
-            lh, lraw, ladj = bh + h, braw + rw, badj + ad
+            if ph is not None and h < ph:      # restart: SOLO se reinician las manos (x); el neto (raw/adj) persiste con el stack del Arena → NO desplazar
+                bh = lh
+            lh, lraw, ladj = bh + h, rw, ad
             stitched.append((lh, lraw, ladj))
             ph = h
         step = max(1, len(stitched) // 160)
         equity[lbl] = [{"h": p[0], "raw": round(p[1], 1), "adj": round(p[2], 1)} for p in stitched[::step]]
+    # equity EN VIVO: fusiona TODOS los runs de la temporada/competición actual del agente en UNA curva acumulada
+    live_equity = {}
+    try:
+        _my = _my_agent_id()
+        _ccr = c.execute("select competition_id from decisions where agent_id=? and competition_id is not null "
+                         "and competition_id!='' order by ts desc limit 1", (_my,)).fetchone()
+        if _ccr and _ccr[0]:
+            _s4 = {r[0] for r in c.execute("select distinct run_label from decisions where competition_id=?", (_ccr[0],))}
+            bh = 0.0; lh = lraw = ladj = 0.0; ph = None; prl = None; st_ = []
+            for (rl, h, rw, ad) in eqrows:                 # eqrows ya viene ordenado por ts
+                if rl not in _s4:
+                    continue
+                h = h or 0; rw = rw or 0; ad = ad or 0
+                if (prl is not None and rl != prl) or (ph is not None and h < ph):   # restart/cambio de deploy: SOLO se reinician las manos; el neto persiste con el stack → NO desplazar
+                    bh = lh
+                lh, lraw, ladj = bh + h, rw, ad
+                st_.append((lh, lraw, ladj)); ph = h; prl = rl
+            if st_:
+                step2 = max(1, len(st_) // 160)
+                live_equity["en vivo (temporada actual)"] = [{"h": p[0], "raw": round(p[1], 1), "adj": round(p[2], 1)} for p in st_[::step2]]
+    except Exception:
+        pass
     c.close()
     return {
         "ts": time.time(), "hands": hands, "decisions": total, "m3": m3, "heur": eng.get("heur", 0),
@@ -194,7 +215,7 @@ def _state():
         "ab": {"std": arm(False), "wide": arm(True)},
         "classes": classes, "ranks": list(RANKS), "bypos": bypos,
         "streets": streets, "strength": strength, "m3street": m3street, "m3str": m3str,
-        "arch": arch, "recent": recent, "equity": equity, "enemy": enemy,
+        "arch": arch, "recent": recent, "equity": equity, "live_equity": live_equity, "enemy": enemy,
         "svc": {n: _svc(n) for n in ("arena-test", "arena-test-wide", "arena-report.timer", "arena-dash")},
         "engines": engines,
     }
@@ -276,15 +297,24 @@ def _hands(limit=600):
     except Exception as e:
         return {"hands": [], "error": str(e)}
     my = _my_agent_id()
+    _cc = None
+    try:                                    # competición actual del agente (la más reciente) → unifica sus runs de esa season
+        r = c.execute("select competition_id from decisions where agent_id=? and competition_id is not null "
+                      "and competition_id!='' order by ts desc limit 1", (my,)).fetchone()
+        _cc = r[0] if r else None
+    except Exception:
+        _cc = None
+    _cond = _MY_DEC + (" AND competition_id = ?" if _cc else "")
+    _args = (my, my) + ((_cc,) if _cc else ())
     rows = c.execute(
         "select ts,hand_key,street,pos,hole,hand_class,board,action,amount,engine,run_label,pot,spr "
-        "from decisions where " + _MY_DEC + " order by ts desc limit ?", (my, my, limit * 6)).fetchall()
+        "from decisions where " + _cond + " order by ts desc limit ?", _args + (limit * 6,)).fetchall()
     resmap = {}
     try:
-        for tid, delta, winners, rboard in c.execute("select table_id, chip_delta, winners, board from hand_results"):
+        for tid, delta, winners, rboard, fpot in c.execute("select table_id, chip_delta, winners, board, pot from hand_results"):
             wl = _lj(winners)
             resmap[tid] = (delta, (wl[0].get("agentName") or wl[0].get("agentId")) if wl else None,
-                           len((rboard or "").split()), len(wl))
+                           len((rboard or "").split()), len(wl), fpot)
     except Exception:
         pass
     c.close()
@@ -318,7 +348,9 @@ def _hands(limit=600):
         moves = " · ".join(_slab.get(st, st) + ": " + ", ".join(_byst[st])
                            for st in ("preflop", "flop", "turn", "river") if st in _byst)
         rr = resmap.get(k.split(":")[0])
-        dl, wn, bl, nw = rr if rr else (None, None, None, None)
+        dl, wn, bl, nw, fp = rr if rr else (None, None, None, None, None)
+        if dl is not None or fp:                 # bote = max(observado, liquidado, 2×|neto|): el Arena no da el bote por mano, pero en HU el bote ≈ 2× lo que cambia de manos (cada uno aporta ~la mitad) → corrige los all-in donde el bote de las decisiones es de ANTES del jam
+            h["pot"] = max(h["pot"], int(fp or 0), 2 * abs(int(dl or 0)))
         if bl is None:
             reached = next((s for s in ("river", "turn", "flop", "preflop") if s in h["streets"]), "preflop")
         elif bl >= 5:
@@ -414,7 +446,26 @@ def _players(limit=400):
     return {"players": out}
 
 
-COACH_NEED = 5000
+COACH_NEED = 500       # HU S4: empezar a evaluar/coachear desde 500 manos
+
+
+def _deployed_knobs():
+    """Knobs de la estrategia REALMENTE desplegada (NO los defaults 6-max del proceso dashboard):
+    el dashboard importa decide_system7 con KN por defecto; la estrategia HU se carga SOLO en el
+    run_pvp del deploy → el coach debe leer los knobs del deploy ACTIVO, no `decide_system7.KN`."""
+    kn = dict(KN_DEFAULTS)
+    try:
+        deploys = s7_api._jload(s7_api._DEPLOYS_PATH, {})
+        agent = next((m.get("agent") for m in deploys.values()
+                      if isinstance(m, dict) and m.get("agent")), None)
+        strat = (s7_api.s7_agents.load(agent) or {}).get("strategy") if agent else ""
+        if strat and s7_strat:
+            cfg = s7_strat.load(strat) or {}
+            kn.update({k: v for k, v in (cfg.get("knobs") or {}).items()
+                       if k in KN_DEFAULTS and isinstance(v, (int, float))})
+    except Exception:
+        pass
+    return kn
 
 
 def _coach(window=None):
@@ -467,28 +518,28 @@ def _coach(window=None):
         vol, pfr, npf = v[0]
         vp, pf = round(100 * (vol or 0) / npf), round(100 * (pfr or 0) / npf)
         gap = vp - pf
-        findings.append({"k": "VPIP / PFR", "v": f"{vp}% / {pf}%", "ref": "~22 / 18"})
-        vs_opt.append({"k": "VPIP", "you": f"{vp}%", "target": "20–26%",
-                       "verdict": verdict(vp, 20, 26, 4), "note": "manos jugadas voluntariamente"})
-        vs_opt.append({"k": "PFR", "you": f"{pf}%", "target": "16–20%",
-                       "verdict": verdict(pf, 16, 20, 4), "note": "frecuencia de subida preflop"})
-        vs_opt.append({"k": "Gap VPIP-PFR", "you": f"{gap}", "target": "≤8",
-                       "verdict": verdict(gap, 0, 8, 4), "note": "demasiado flat si es alto"})
-        if vp < 16:
-            advice.append(f"Muy tight (VPIP {vp}%). Abre más en BTN/CO/SB.")
-        elif vp > 30:
-            advice.append(f"VPIP {vp}% alto; recorta manos marginales fuera de posición.")
-        if gap > 10:
-            advice.append(f"Gap VPIP-PFR {gap} grande → demasiado flat preflop; 3-betea o foldea más.")
+        findings.append({"k": "VPIP / PFR", "v": f"{vp}% / {pf}%", "ref": "HU ~75 / 47"})
+        vs_opt.append({"k": "VPIP", "you": f"{vp}%", "target": "68–82%",
+                       "verdict": verdict(vp, 68, 82, 6), "note": "HU: se juegan MUCHAS manos (SB abre ~85%, BB defiende ~65%)"})
+        vs_opt.append({"k": "PFR", "you": f"{pf}%", "target": "40–54%",
+                       "verdict": verdict(pf, 40, 54, 6), "note": "HU: el SB sube casi siempre; el BB sobre todo iguala"})
+        vs_opt.append({"k": "Gap VPIP-PFR", "you": f"{gap}", "target": "18–34",
+                       "verdict": verdict(gap, 18, 34, 6), "note": "HU: un gap alto es NORMAL (el BB defiende igualando)"})
+        if vp < 62:
+            advice.append(f"Demasiado tight para HU (VPIP {vp}%). El SB debe abrir ~80-90% y el BB defender ~60-70%.")
+        elif vp > 88:
+            advice.append(f"VPIP {vp}% excesivo incluso en HU; el BB no debe defender casi todo OOP.")
+        if pf < 36:
+            advice.append(f"PFR {pf}% bajo para HU; el SB debe subir-primero la mayoría de manos (menos limps).")
     cb = q("select sum(case when action in('bet','all-in') then 1 else 0 end),"
            "sum(case when action='check' then 1 else 0 end) from decisions "
            "where street='flop' and (call_chips is null or call_chips<=0)" + hk())
     if cb and cb[0][0] is not None and ((cb[0][0] or 0) + (cb[0][1] or 0)) >= 100:
         bets, checks = cb[0][0] or 0, cb[0][1] or 0
         cbp = round(100 * bets / (bets + checks))
-        findings.append({"k": "C-bet flop", "v": f"{cbp}%", "ref": "55–72%"})
-        vs_opt.append({"k": "C-bet flop", "you": f"{cbp}%", "target": "55–72%",
-                       "verdict": verdict(cbp, 55, 72, 8), "note": "apuesta de continuación tras subir preflop"})
+        findings.append({"k": "C-bet flop", "v": f"{cbp}%", "ref": "HU 52–70%"})
+        vs_opt.append({"k": "C-bet flop", "you": f"{cbp}%", "target": "52–70%",
+                       "verdict": verdict(cbp, 52, 70, 8), "note": "HU: c-bet alto EN posición (SB); más bajo OOP (BB)"})
         if cbp > 85:
             advice.append(f"C-bet flop muy alto ({cbp}%); equilibra con más checks de protección de rango.")
         elif cbp < 45:
@@ -498,16 +549,31 @@ def _coach(window=None):
            "where street='flop' and call_chips>0" + hk())
     if ff and ff[0][1] and ff[0][1] >= 200:
         ftc = round(100 * (ff[0][0] or 0) / ff[0][1])
-        findings.append({"k": "Fold-to-bet flop", "v": f"{ftc}%", "ref": "<55%"})
-        vs_opt.append({"k": "Fold-to-cbet flop", "you": f"{ftc}%", "target": "45–55%",
-                       "verdict": verdict(ftc, 45, 55, 6), "note": "te explotan si foldeas de más"})
-        if ftc > 58:
-            advice.append(f"Foldeas demasiado al c-bet en flop ({ftc}%). Defiende más (flota/raise).")
+        findings.append({"k": "Fold-to-bet flop", "v": f"{ftc}%", "ref": "HU <50%"})
+        vs_opt.append({"k": "Fold-to-cbet flop", "you": f"{ftc}%", "target": "38–50%",
+                       "verdict": verdict(ftc, 38, 50, 6), "note": "HU: rangos anchos → foldear de más te explota"})
+        if ftc > 54:
+            advice.append(f"Foldeas demasiado al c-bet en flop ({ftc}%) para HU. Defiende más (flota/check-raise).")
     pos = q("select pos,count(*),sum(voluntary),sum(preflop_raise) from decisions "
             "where street='preflop' and pos!=''" + hk() + " group by pos")
     order = {"UTG": 0, "MP": 1, "CO": 2, "BTN": 3, "SB": 4, "BB": 5}
     bypos = sorted([{"pos": r[0], "n": r[1], "vpip": round(100 * r[2] / r[1]) if r[1] else 0,
                      "pfr": round(100 * r[3] / r[1]) if r[1] else 0} for r in pos], key=lambda x: order.get(x["pos"], 9))
+    for bp in bypos:                              # objetivos HU por posición (SB=botón que ataca / BB=defensa)
+        if bp["pos"] == "SB" and bp["n"] >= 50:
+            vs_opt.append({"k": "SB VPIP (botón)", "you": f"{bp['vpip']}%", "target": "78–92%",
+                           "verdict": verdict(bp["vpip"], 78, 92, 6), "note": "el SB ataca casi siempre la BB"})
+            vs_opt.append({"k": "SB PFR (sube 1º)", "you": f"{bp['pfr']}%", "target": "62–84%",
+                           "verdict": verdict(bp["pfr"], 62, 84, 8), "note": "subir-primero > limpear en HU"})
+            if bp["pfr"] < 55:
+                advice.append(f"SB sube poco ({bp['pfr']}%): en HU el botón debe abrir-subiendo ~70-80%, no limpear.")
+        if bp["pos"] == "BB" and bp["n"] >= 50:
+            vs_opt.append({"k": "BB VPIP (defensa)", "you": f"{bp['vpip']}%", "target": "55–75%",
+                           "verdict": verdict(bp["vpip"], 55, 75, 8), "note": "defender ancho vs el open del SB (call+3bet)"})
+            vs_opt.append({"k": "BB 3bet (PFR)", "you": f"{bp['pfr']}%", "target": "12–26%",
+                           "verdict": verdict(bp["pfr"], 12, 26, 6), "note": "3bet de valor + faroles polarizados"})
+            if bp["vpip"] < 50:
+                advice.append(f"BB defiende poco ({bp['vpip']}%): vs el open del SB hay que defender ~60-70% para no ser explotado.")
     buckets = q("select d.pos, sum(hr.chip_delta), count(distinct d.hand_key) from decisions d "
                 "join hand_results hr on hr.table_id = substr(d.hand_key,1,instr(d.hand_key,':')-1) "
                 "where d.street='preflop' and d.pos!=''" + hk("d.hand_key") + " group by d.pos")
@@ -525,13 +591,29 @@ def _coach(window=None):
     if pan and pan[0][0]:
         vs_panel = {"bb100": round(pan[0][1], 1) if pan[0][1] is not None else None,
                     "runs": pan[0][0], "hands": pan[0][2] or 0}
-    opp = [{"name": o[0], "vpip": o[1], "pfr": o[2], "af": o[3]} for o in q("select name,vpip,pfr,af from agent_stats")]
+    # rivales HU REALES (opp_profiles, escritos por run_pvp durante el juego HU), en porcentaje
+    opp = [{"name": o[0], "vpip": round((o[1] or 0) * (100 if (o[1] or 0) <= 1 else 1)),
+            "pfr": round((o[2] or 0) * (100 if (o[2] or 0) <= 1 else 1)),
+            "af": round(o[3], 1) if o[3] is not None else None}
+           for o in q("select name,vpip,pfr,af from opp_profiles where n>=50 order by n desc limit 8")]
+    since_change, stale = None, False           # manos desde el último cambio de ESTRATEGIA = mtime del JSON desplegado (no el deploy, que se reinicia sin cambiar nada)
+    try:
+        _dp = s7_api._jload(s7_api._DEPLOYS_PATH, {})
+        _ag = next((m.get("agent") for m in _dp.values() if isinstance(m, dict) and m.get("agent")), None)
+        _strat = (s7_api.s7_agents.load(_ag) or {}).get("strategy") if _ag else ""
+        if _strat:
+            _mt = os.path.getmtime(os.path.join(s7_strat.DIR, _strat + ".json"))
+            since_change = (q("select count(distinct hand_key) from decisions where ts > ?", (_mt,)) or [[0]])[0][0]
+            stale = since_change < 300
+    except Exception:
+        pass
     c.close()
     if not advice:
         advice.append("Sin leaks claros con esta muestra; sigue acumulando.")
     return {"locked": False, "hands": total_hands, "win_hands": win_hands, "window": (n or "all"),
             "vs_opt": vs_opt, "vs_panel": vs_panel, "findings": findings, "bypos": bypos,
-            "posres": posres, "ab": ab, "advice": advice, "opp": opp}
+            "posres": posres, "ab": ab, "advice": advice, "opp": opp,
+            "since_change": since_change, "stale": stale}
 
 
 def _validate_strat(cfg):
@@ -588,27 +670,24 @@ def _coach_compute(hands, window=None):
             meth = open(os.path.join(HERE, "system7_prompt.md")).read()
         except Exception:
             meth = ""
-        cur = {}
-        try:
-            import decide_system7 as _D
-            cur = dict(_D.KN)
-        except Exception:
-            pass
+        cur = _deployed_knobs()                  # knobs del DEPLOY activo (no los defaults 6-max del dashboard)
         diag = _coach(window)
         win_txt = ("últimas %s manos" % window) if window not in (None, "all", "") else "todas las manos"
         leaks = "; ".join("%s: %s vs objetivo %s [%s]" % (o["k"], o["you"], o["target"], o["verdict"])
                           for o in (diag.get("vs_opt") or []))
-        system = ("Eres un coach de NLHE 6-max de élite (metodología EducaPoker / GTO node-locking). "
-                  "Te paso el informe de System 7 contra un panel near-GTO (DeepCFR), su config actual y un "
-                  "diagnóstico tu-juego-vs-óptimo de la ventana analizada. "
-                  "(1) Análisis ACCIONABLE de leaks (preflop por posición + postflop). "
+        rivals = "; ".join("%s (VPIP %s/PFR %s/AF %s)" % (o.get("name"), o.get("vpip"), o.get("pfr"), o.get("af"))
+                           for o in (diag.get("opp") or [])[:6]) or "(aún sin lecturas de rivales)"
+        system = ("Eres un coach de NLHE HEADS-UP (HU) de élite (metodología EducaPoker / GTO node-locking). "
+                  "Jugamos HU cash (~100bb+) contra los bots de la Playground S4. Te paso el diagnóstico "
+                  "tu-juego-vs-óptimo-HU, la config actual y los RIVALES HU que enfrentamos. "
+                  "(1) Análisis ACCIONABLE de leaks HU: SB (botón) abrir/robar/sizing, BB defensa+3bet+juego OOP, "
+                  "postflop por posición; explota a los rivales según sus stats. "
                   "(2) Propón UNA versión nueva partiendo de la actual. Termina con SOLO un bloque ```json``` con las "
-                  "claves a CAMBIAR: opening_ranges {pos:[tokens '22+','A2s+','KTo+']}, threebet_value, threebet_bluff, "
-                  "knobs {open_size_bb,threebet_mult,value_eq,station_mult,cbet_bluff_frac,commit_spr,perejil_flop,"
-                  "perejil_turn,perejil_relief}. Incluye solo lo que cambies. Español, MUY conciso, ve al grano "
-                  "sin razonar de más.\n\n" + meth[:400])
-        user = ("VENTANA: %s\nDIAGNÓSTICO vs óptimo: %s\nCONFIG ACTUAL knobs: %s\n\nINFORME:\n%s"
-                % (win_txt, leaks or "(sin datos)", json.dumps(cur), rep))
+                  "claves a CAMBIAR: opening_ranges {SB:[tokens '22+','A2s+','KTo+'], BB:[...]} (en HU SOLO importan SB y BB), "
+                  "threebet_value, threebet_bluff, knobs {open_size_bb,threebet_mult,value_eq,station_mult,cbet_bluff_frac,"
+                  "commit_spr,perejil_flop,perejil_turn,perejil_relief}. Incluye solo lo que cambies. Español, MUY conciso.\n\n" + meth[:400])
+        user = ("VENTANA: %s\nDIAGNÓSTICO vs óptimo HU: %s\nRIVALES HU: %s\nCONFIG ACTUAL knobs: %s\n\nINFORME:\n%s"
+                % (win_txt, leaks or "(sin datos)", rivals, json.dumps(cur), rep))
         _cerr = None
         if s7_mllm is not None:
             _r = s7_mllm._chat("minimax", os.environ.get("S7_MODEL", "MiniMax-M3"), system, user, max_tokens=10000)
@@ -830,31 +909,28 @@ def _stratgen_compute(window, mode):
         os.environ["S7_STATS_DB"] = s7_api._dbpath(_stratgen_cache.get("game"))
         import llm_system7
         persona = (
-            "Eres un jugador profesional de NLHE 6-max online, ganador, con millones de manos jugadas al año y "
-            "dominio de rangos GTO y de explotación. Diseña una estrategia COMPLETA para un bot de cash 100bb. "
+            "Eres un jugador profesional de NLHE HEADS-UP (HU) online, ganador, con millones de manos y dominio "
+            "de rangos GTO y de explotación en HU. Diseña una estrategia COMPLETA para un bot de HU cash 100bb+. "
             "Devuelve un resumen de 1-2 frases y DESPUÉS SOLO un bloque ```json``` con TODAS estas claves: "
-            "opening_ranges con las 6 posiciones UTG,MP,CO,BTN,SB,BB (cada una lista de tokens '22+','A2s+','KTo+' "
-            "o combos explícitos 'AKs'); threebet_value (lista de clases); threebet_bluff (lista); y knobs "
+            "opening_ranges con SB y BB (en HU SOLO juegan esas dos: SB=botón que abre, BB=defensa; cada una lista de "
+            "tokens '22+','A2s+','KTo+' o combos 'AKs'); threebet_value (lista); threebet_bluff (lista); y knobs "
             "{open_size_bb,threebet_mult,value_eq,station_mult,cbet_bluff_frac,commit_spr,perejil_flop,perejil_turn,"
-            "perejil_relief}. Rangos coherentes y posicionales (UTG tight ~12%, BTN ancho ~45%). Español, conciso.")
+            "perejil_relief}. Rangos HU coherentes: SB abre ~80-90% (muy ancho), BB defiende ~60-70% (call+3bet). Español, conciso.")
         if mode == "scratch":
-            user = ("Crea tu estrategia IDEAL de jugador pro para 6-max cash 100bb contra un panel near-GTO. "
-                    "No mires ningún histórico: dame tu rango de apertura por posición y tus knobs óptimos.")
+            user = ("Crea tu estrategia IDEAL de jugador pro de HEADS-UP cash 100bb+ contra los bots de la Playground. "
+                    "No mires histórico: dame el rango del SB (botón, abre ancho) y el del BB (defensa), y tus knobs óptimos para HU.")
         else:
             diag = _coach(window)
-            cur = dict(KN_DEFAULTS)
-            try:
-                import decide_system7 as _D
-                cur = {k: _D.KN.get(k, KN_DEFAULTS[k]) for k in KN_DEFAULTS}
-            except Exception:
-                pass
+            cur = _deployed_knobs()              # knobs del DEPLOY activo (no los defaults 6-max del dashboard)
             leaks = "; ".join("%s: tú %s vs objetivo %s [%s]" % (o["k"], o["you"], o["target"], o["verdict"])
                               for o in (diag.get("vs_opt") or []))
             adv = " ".join(diag.get("advice") or [])
+            rivals = "; ".join("%s (VPIP %s/PFR %s)" % (o.get("name"), o.get("vpip"), o.get("pfr"))
+                               for o in (diag.get("opp") or [])[:6]) or "(aún sin lecturas)"
             wt = ("últimas %s manos" % window) if window not in (None, "all", "") else "todas las manos"
-            user = ("Parte de esta config y ARREGLA estos leaks detectados (ventana=%s).\n"
-                    "CONFIG knobs actual: %s\nDIAGNÓSTICO vs óptimo: %s\nCONSEJOS: %s\n"
-                    "Devuelve la estrategia corregida completa (las 6 posiciones)." % (wt, json.dumps(cur), leaks, adv))
+            user = ("Parte de esta config y ARREGLA estos leaks de HU (ventana=%s).\n"
+                    "CONFIG knobs actual: %s\nDIAGNÓSTICO vs óptimo HU: %s\nRIVALES HU: %s\nCONSEJOS: %s\n"
+                    "Devuelve la estrategia HU corregida completa (rangos de SB y BB)." % (wt, json.dumps(cur), leaks, rivals, adv))
         txt, cerr = None, None
         if s7_mllm is not None:
             r = s7_mllm._chat("minimax", os.environ.get("S7_MODEL", "MiniMax-M3"), persona, user, max_tokens=10000)
@@ -2115,6 +2191,10 @@ class H(BaseHTTPRequestHandler):
             return
         if p.startswith("/api/tracker/opponents"):
             self._send(json.dumps(s7_api.tracker_opponents(), default=str), "application/json")
+            return
+        if p.startswith("/api/opponent"):
+            _oid = _pq(_up(p).query).get("id", [""])[0]
+            self._send(json.dumps(s7_api.opponent_detail(_oid), default=str), "application/json")
             return
         if p.startswith("/api/tracker/own"):
             self._send(json.dumps(s7_api.tracker_own(), default=str), "application/json")

@@ -314,6 +314,13 @@ def _strength(hole, board, texture) -> str:
     if rc == 6:                       # trips / set
         return "MMF" if texture != "extreme" else "MM"
     if rc == 7:                       # two pair
+        board_paired = len(set(bi)) < len(bi)
+        if board_paired:              # en board emparejado la "doble pareja" suele usar la pareja del board → vulnerable a trips/boat
+            unp = [r for r in set(bi) if bi.count(r) == 1]
+            top_unp = max(unp) if unp else -1
+            if pocket and hi[0] < top_unp:   # underpair cabalgando la pareja del board (99 en KKJ5) → bluff-catcher, NO comprometer
+                return "MM"
+            return "MF"               # doble pareja real en board emparejado: fuerte, pero no monstruo
         return "MMF" if texture in ("dry", "semi") else "MF"
     if rc == 8:                       # one pair — refine
         if pocket and hi[0] > top:
@@ -720,7 +727,7 @@ def decide(table: dict, deadline_s: float = 10.0,
         else:
             # AIR / draw: Perejil bluff vs weakness; cbet-bluff on overfolder; en HU el botón (IP) c-betea de rango.
             weak_spot = dyn == "static" and not station
-            hu_ip_cbet = _HU and pos == "SB" and texture in ("dry", "semi")     # range-cbet en posición HU
+            hu_ip_cbet = _HU and pos == "SB" and texture != "extreme"           # range-cbet IP HU: dry/semi/coord (no en las MUY húmedas) → sube la freq de c-bet
             if not station and (_perejil_ok(adj_outs, board_len, n_villains, overfolder) or
                                 (overfolder and texture in ("dry", "semi")) or hu_ip_cbet):
                 br = allowed.get("betRange") or {}

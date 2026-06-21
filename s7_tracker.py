@@ -147,7 +147,7 @@ def _harvest_tables(c, agent_id, rmap):
         s7_stats.log_hand_result(str(tid), board, winners, shown,
                                  int(mine.get("payoutChips") or 0),
                                  rr.get("chip_delta") or 0, mine.get("handName") or "",
-                                 rr.get("replay_url") or "")
+                                 rr.get("replay_url") or "", int(t.get("potChips") or 0))
         for s in seats:
             oid = s.get("agentId")
             if not oid or oid == agent_id:

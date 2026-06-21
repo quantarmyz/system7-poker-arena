@@ -247,7 +247,7 @@ def _any_key():
 
 def production_competitions():
     """Eventos dev.fun jugables: Eval + competiciones activas (torneos/playground) vía list-active."""
-    out = [{"id": "eval", "name": "Poker Eval S1 · 500 manos (gratis)", "kind": "eval", "paid": False}]
+    out = []                                     # producción bloqueada a la Playground activa (S4): sin Eval ni torneos
     key = _any_key()
     if not key:
         return {"competitions": out, "note": "sin credenciales para listar torneos"}
@@ -266,11 +266,27 @@ def production_competitions():
                 continue
             nm = str(x.get("name", "")) or str(x.get("id"))
             paid = bool(x.get("buyIn") or x.get("entryFee"))
-            kind = "tournament" if "tournament" in nm.lower() else "playground"
-            out.append({"id": x.get("id"), "name": nm, "kind": kind, "paid": paid})
+            if "playground" not in nm.lower():   # SOLO la Playground (excluye Eval, torneos, etc.)
+                continue
+            out.append({"id": x.get("id"), "name": nm, "kind": "playground", "paid": paid})
     except Exception as e:
         out.append({"id": "", "name": "(no se pudieron listar torneos: %s)" % str(e)[:80], "kind": "error", "paid": False})
     return {"competitions": out}
+
+
+_ACTIVE_CACHE = {"ts": 0.0, "ids": {}, "pg": None}
+
+
+def _active_comps():
+    """({id: nombre} de competiciones activas, dict {id,name} de la Playground viva) — cacheado 120s (anti-429)."""
+    now = time.time()
+    if _ACTIVE_CACHE["ts"] and now - _ACTIVE_CACHE["ts"] < 120:
+        return _ACTIVE_CACHE["ids"], _ACTIVE_CACHE["pg"]
+    comps = production_competitions().get("competitions") or []
+    ids = {c["id"]: c["name"] for c in comps if c.get("id") and c.get("kind") not in ("eval", "error")}
+    pg = next(({"id": c["id"], "name": c["name"]} for c in comps if c.get("kind") == "playground" and c.get("id")), None)
+    _ACTIVE_CACHE.update(ts=now, ids=ids, pg=pg)
+    return ids, pg
 
 
 def _prod_active():
@@ -300,7 +316,7 @@ def _prod_launch(agent, competition):
     else:
         env["ARENA_COMPETITION_ID"] = competition
         env["S7_CREDS_FILE"] = os.path.join(_DATA, ".arena-pg-credentials")
-        env["S7_RUN_LABEL"] = label
+        env["S7_RUN_LABEL"] = "playground"      # agrupa TODOS los deploys del Playground bajo UN agente
         # M3 en vivo: llamadas no bloqueantes (pool) + acotadas por reloj (run_pvp async path)
         env["S7_PVP_ASYNC"] = "1"
         env["S7_PVP_WORKERS"] = "4"
@@ -325,7 +341,7 @@ def _prod_launch(agent, competition):
         env["S7_MAX_TOKENS"] = "1500"          # M2 da answer completo en ~1500 tok
         env["S7_HUD"] = "1"                     # node-locking por rival (HUD)
         env["S7_TRACKER"] = "1"                # leer opp_profiles (tracker) antes que el live
-        env["S7_HUD_MIN_N"] = os.environ.get("S7_HUD_MIN_N", "3500")   # adapta solo con >=3500 manos del Arena
+        env["S7_HUD_MIN_N"] = os.environ.get("S7_HUD_MIN_N", "1500")   # node-locking ACTIVO: rivales S4 tienen ~1800-1933 manos del Arena (3500 nunca disparaba)
         argv = s7_jobs.pyrun("run_pvp.py")
         compname = competition
         try:                                   # tracker sidecar: opp_profiles (HUD) + opp_hands durante el juego
@@ -338,7 +354,8 @@ def _prod_launch(agent, competition):
     except Exception as e:
         return {"error": str(e)[:300]}
     d = _jload(_DEPLOYS_PATH, {})
-    d[label] = {"agent": agent, "competition": competition, "compname": compname, "game": game, "ts": time.time()}
+    d[label] = {"agent": agent, "competition": competition, "compname": compname, "game": game,
+                "run_label": env.get("S7_RUN_LABEL") or label, "ts": time.time()}
     _jwrite(_DEPLOYS_PATH, d)
     return {"ok": True, "unit": unit, "label": label, "agent": agent}
 
@@ -346,6 +363,9 @@ def _prod_launch(agent, competition):
 def production_deploy(body):
     agent = str(body.get("agent", "")).strip().lower()
     comp = str(body.get("competition", "") or "")
+    _ids, _pg = _active_comps()                  # bloqueo: producción SOLO contra la Playground activa (S4)
+    if _pg and _pg.get("id"):
+        comp = _pg["id"]
     if not s7_agents.load(agent):
         return {"error": "perfil no encontrado"}
     deploys = _jload(_DEPLOYS_PATH, {})
@@ -392,7 +412,7 @@ def production_status():
         return {"label": j["label"], "unit": j["unit"], "state": j["state"],
                 "agent": m.get("agent"), "competition": m.get("compname") or m.get("competition"),
                 "continuous": _is_continuous(m.get("competition")),
-                "hands": hpl.get(j["label"], 0)}      # manos reales del agente (= conteo del ranking)
+                "hands": hpl.get(m.get("run_label") or j["label"], 0)}   # por run_label del deploy (Playground agrupado)
     return {"running": bool(active), "active": [mk(j) for j in active],
             "jobs": [mk(j) for j in jobs], "queue": _jload(_QUEUE_PATH, []), "bankroll": snap}
 
@@ -560,11 +580,18 @@ def production_session(label=""):
         return {"error": str(e)}
     if label:
         cond, A = "run_label like ?", (label + "%",)
-    else:                                   # sin label: unificar al agente autenticado
+    else:                                   # sin label: unificar al agente autenticado, en su competición/temporada actual
         _my = _my_agent_id()
         cond = ("(agent_id = ? OR (agent_id IS NULL AND run_label LIKE 'prod-%' "
                 "AND run_label NOT IN (SELECT run_label FROM runs WHERE agent_id IS NOT NULL AND agent_id != ?)))")
         A = (_my, _my)
+        try:                                # acota a la competición actual (la más reciente jugada) → unifica TODOS sus runs de esa season (p.ej. S4)
+            _cc = c.execute("select competition_id from decisions where agent_id=? and competition_id is not null "
+                            "and competition_id!='' order by ts desc limit 1", (_my,)).fetchone()
+            if _cc and _cc[0]:
+                cond += " AND competition_id = ?"; A = A + (_cc[0],)
+        except Exception:
+            pass
 
     def q(cols, extra="", extra_args=()):
         try:
@@ -597,11 +624,28 @@ def production_session(label=""):
     except Exception:
         runs = []
     bbs = [r[0] for r in runs if r[0] is not None and (r[1] or 0) >= 400]
+    agg = _ci(bbs)
+    if not bbs and hands >= 30:                  # sin runs de Eval → win rate EN VIVO desde la equity (raw + EV), neto ACUMULADO
+        try:
+            mb = c.execute("select v from meta where k='big_blind'").fetchone()
+            try:
+                bb = float(json.loads(mb[0])) if (mb and mb[0]) else 0.0
+            except Exception:
+                bb = 0.0
+            bb = bb or 10.0                                  # 1000 de buy-in ≈ 100bb → bb=10 por defecto
+            last = c.execute("select raw_chips, adj_chips from equity where run_label like ? order by ts desc limit 1",
+                             ((label or "playground") + "%",)).fetchone()
+            tr, ta = (last[0] or 0, last[1] or 0) if last else (0, 0)   # neto ACUMULADO = último raw (el stack del Arena persiste entre reinicios; NO sumar segmentos)
+            agg = {"n_evals": 1, "live": True, "bb": bb, "ci": None,
+                   "mean": round((tr / bb) / hands * 100, 1),
+                   "adj": round((ta / bb) / hands * 100, 1)}
+        except Exception:
+            pass
     c.close()
     return {"label": label, "hands": hands, "decisions": total,
             "m3pct": round(100 * m3 / total, 1) if total else 0,
             "classes": classes, "ranks": list("AKQJT98765432"), "bypos": bypos,
-            "postflop": post, "agg": _ci(bbs)}
+            "postflop": post, "agg": agg}
 
 
 def production_account():
@@ -693,7 +737,7 @@ def tracker_opponents(limit=200):
     except Exception as e:
         return {"error": str(e)}
     out = []
-    _thr = int(os.environ.get("S7_HUD_MIN_N", "3500"))   # umbral de adaptación (= el del motor)
+    _thr = int(os.environ.get("S7_HUD_MIN_N", "1500"))   # umbral de adaptación (= el del motor)
     try:
         import decide_system7 as _DS
     except Exception:
@@ -716,6 +760,62 @@ def tracker_opponents(limit=200):
         pass
     c.close()
     return {"opponents": out}
+
+
+def opponent_detail(opp_id):
+    """Ficha de un rival: HUD (perfil del Arena) + manos suyas mostradas (showdowns) + rango de showdown."""
+    opp_id = str(opp_id or "")
+    if not opp_id:
+        return {"error": "sin id de rival"}
+    try:
+        c = _ro()
+    except Exception as e:
+        return {"error": str(e)}
+    try:
+        import decide_system7 as _DS
+    except Exception:
+        _DS = None
+    prof = None
+    try:
+        r = c.execute("select opp_id,name,n,vpip,pfr,af,bluff_pct,wtsd,wsd,style,shown_hands,last_seen "
+                      "from opp_profiles where opp_id=?", (opp_id,)).fetchone()
+        if r:
+            sty = (json.loads(r[9]) if r[9] else None)
+            arc = "UNKNOWN"
+            if _DS:
+                try:
+                    arc = _DS._archetype({"N": r[2], "vpip": r[3], "pfr": r[4], "af": r[5], "playingStyle": sty})
+                except Exception:
+                    pass
+            prof = {"agent_id": r[0], "name": r[1], "n": r[2], "vpip": r[3], "pfr": r[4], "af": r[5],
+                    "bluff": r[6], "wtsd": r[7], "wsd": r[8], "style": sty, "shown_hands": r[10],
+                    "last_seen": r[11], "archetype": arc}
+    except Exception:
+        pass
+    hands, grid, wins = [], {}, 0
+    try:
+        for r in c.execute(
+                "select o.table_id,o.ts,o.hole,o.board,o.hand_name,o.payout,o.won,h.replay_url "
+                "from opp_hands o left join hand_results h on h.table_id=o.table_id "
+                "where o.opp_id=? order by o.ts desc limit 300", (opp_id,)):
+            hole = r[2] or ""
+            hands.append({"table_id": r[0], "ts": r[1], "hole": hole, "board": r[3],
+                          "hand_name": r[4], "payout": r[5], "won": bool(r[6]), "replay_url": r[7] or ""})
+            if r[6]:
+                wins += 1
+            if _DS and hole:
+                try:
+                    cls = _DS._hand_class([x for x in hole.split(",") if x][:2])
+                    if cls:
+                        grid[cls] = grid.get(cls, 0) + 1
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    c.close()
+    n = len(hands)
+    return {"profile": prof, "hands": hands, "grid": grid, "showdowns": n,
+            "sd_wins": wins, "sd_winrate": round(100.0 * wins / n) if n else None}
 
 
 def tracker_own(limit=300):
