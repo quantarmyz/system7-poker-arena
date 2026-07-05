@@ -42,6 +42,20 @@ def _log(*a):
     print("[s7-tracker]", *a, flush=True)
 
 
+def _active_comp():
+    """Competición vigente: preferir meta.active_comp (run_pvp la actualiza en cada rollover)
+    sobre el env ARENA_COMPETITION_ID, que queda congelado en el valor del deploy."""
+    try:
+        r = sqlite3.connect(s7_stats.DB, timeout=10).execute(
+            "select v from meta where k='active_comp'").fetchone()
+        v = json.loads(r[0]) if (r and r[0]) else ""
+        if v:
+            return v
+    except Exception:
+        pass
+    return os.environ.get("ARENA_COMPETITION_ID") or ""
+
+
 def _our_agents():
     """Enumera {agentId, apiKey, label} de cada agente que controlamos (creds en disco)."""
     out, seen, cand = [], set(), []
@@ -122,7 +136,7 @@ def _harvest_own(c, agent_id, rmap):
 def _harvest_tables(c, agent_id, rmap):
     """/texas/recent-tables → hand_results + opp_hands. Devuelve {oppId: {name, comp}}."""
     opps = {}
-    comp_q = os.environ.get("ARENA_COMPETITION_ID") or ""   # recent-tables EXIGE competitionId (si no, 400)
+    comp_q = _active_comp()   # recent-tables EXIGE competitionId (si no, 400); sigue rollovers vía meta
     url = f"/texas/recent-tables?limit=100&agentId={agent_id}" + (f"&competitionId={comp_q}" if comp_q else "")
     try:
         rt = c.get(url)
@@ -177,7 +191,7 @@ def _harvest_profiles(c, opps):
     todo = [(oid, info) for oid, info in opps.items() if str(oid) not in fresh][:cap]
     for oid, info in todo:
         name = info.get("name") or oid
-        comp = info.get("comp") or os.environ.get("ARENA_COMPETITION_ID") or ""   # agent-stats EXIGE comp
+        comp = info.get("comp") or _active_comp()   # agent-stats EXIGE comp; sigue rollovers vía meta
         url = f"/texas/agent-stats?agentId={oid}" + (f"&competitionId={comp}" if comp else "")
         try:
             raw = c.get(url)

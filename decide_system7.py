@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover
 
 _RANKS = "23456789TJQKA"
 FALLBACK_REASONING = '{vr: "std", ke: "legal", pp: "pot control"}'
+VERSION = "1.5"   # v1.5: niveles de compromiso (supervivencia leaderboard) — stack-off por profundidad de re-subida + multiway
 _LOG_PATH = os.environ.get("S7_LOG", "s7_decisions.log")
 
 # ── Preflop ranges (EP100-style; extends assets/decide_ranged.py) ──────────────
@@ -169,6 +170,15 @@ _TOURN = {b: _apply_overrides(TOURN_RANGES_DEFAULT.get(b, OPENING_RANGES_STD),
 # Polarised 3-bet bluffs: weak suited-ace blockers (Directiva: A2s-A5s).
 _3BET_BLUFF_BLOCKERS = set(_CFG.get("threebet_bluff") or ["A2s", "A3s", "A4s", "A5s", "K9s", "Q9s"])
 _3BET_VALUE = set(_CFG.get("threebet_value") or ["AA", "KK", "QQ", "JJ", "AKs", "AKo", "AQs"])
+# Manos HECHAS premium con las que SÍ se apila el stack preflop (4bet+/all-in). Frente a una
+# re-subida solo continúan estas; faroles y especulativas foldean (no stack-off con basura).
+_PRE_COMMIT = set(_CFG.get("commit_value") or ["AA", "KK", "QQ", "JJ", "TT", "AKs", "AKo", "AQs"])
+# Niveles de compromiso (supervivencia de leaderboard): rangos con los que se apila el stack según la
+# PROFUNDIDAD de re-subidas + nº de rivales comprometidos. set LITERAL de clases (NO expanden tokens '+').
+# Tier-1 = _PRE_COMMIT (vs un único 3bet) · deep = vs 4bet · allin = vs 5bet+/jam o all-in multiway.
+SURVIVAL = bool(_CFG.get("survival"))
+_COMMIT_DEEP = set(_CFG.get("commit_value_deep") or ["AA", "KK", "QQ", "AKs"])
+_COMMIT_ALLIN = set(_CFG.get("commit_value_allin") or ["AA", "KK"])
 
 # Cbet sizing fraction of pot, per texture+street.
 SIZING = ((_CFG.get("knobs") or {}).get("sizing")) or {
@@ -179,7 +189,9 @@ SIZING = ((_CFG.get("knobs") or {}).get("sizing")) or {
 }
 # Tunable postflop/preflop knobs (defaults = std; overridable per strategy config).
 KN = {"open_size_bb": 2.5, "threebet_mult": 3, "value_eq": 0.62, "station_mult": 1.2,
-      "cbet_bluff_frac": 0.33, "commit_spr": 3, "perejil_flop": 8, "perejil_turn": 10, "perejil_relief": 2}
+      "cbet_bluff_frac": 0.33, "commit_spr": 3, "perejil_flop": 8, "perejil_turn": 10, "perejil_relief": 2,
+      "commit_deep_frac": 0.35, "commit_allin_frac": 0.6, "commit_multi_n": 2,
+      "commit_4bet_bb": 8, "commit_5bet_bb": 22}
 KN.update({k: v for k, v in (_CFG.get("knobs") or {}).items() if k in KN and isinstance(v, (int, float))})
 _PREFLOP_EQ = {
     "AA":.85,"KK":.82,"QQ":.80,"JJ":.77,"TT":.75,"99":.72,"88":.69,"77":.66,
@@ -233,7 +245,7 @@ def _equity(hole, board, n_villains=1, sims=160, deadline_s=10.0) -> float:
         hero = [_TCard.new(_to_treys(c)) for c in hole]
         bt = [_TCard.new(_to_treys(c)) for c in board]
         used = set(hero) | set(bt)
-        rng = random.Random(7)
+        rng = random.Random(sum(ord(ch) for c in hole + board for ch in c) or 7)   # semilla por-mano (no fija): menos sesgo entre manos
         wins = ties = 0
         need = 5 - len(bt)
         for _ in range(sims):
@@ -532,6 +544,28 @@ def _per(adj_outs: int, board_len: int) -> float:
     return min(0.95, adj_outs * mult / 100.0)
 
 
+def _range_discount(pot_odds: float, board_len: int, bluffy: bool, honest: bool) -> float:
+    """Descuento a la equity-vs-ALEATORIO: quien apuesta tiene un rango más fuerte que aleatorio. Más
+    descuento cuanto mayor la apuesta y más tardía la calle; menos vs bluffers (rango ancho), más vs honestos."""
+    d = 0.06 + 0.20 * max(0.0, pot_odds - 0.25) + 0.04 * max(0, board_len - 3)
+    return d * (0.4 if bluffy else (1.5 if honest else 1.0))
+
+
+def _river_blocker(hole, board) -> bool:
+    """¿Tenemos un bloqueador del valor del rival para SELECCIONAR un farol de river? (carta del palo de
+    color con 3+ en mesa → bloquea el color; o carta alta Q+ → bloquea valor broadway/overpairs)."""
+    if len(hole) != 2 or len(board) < 3:
+        return False
+    suits = [c[-1].lower() for c in board]
+    fs = next((s for s in set(suits) if suits.count(s) >= 3), None)
+    for c in hole:
+        if fs and c[-1].lower() == fs:
+            return True
+        if _rank_idx(c) >= _RANKS.index("Q"):
+            return True
+    return False
+
+
 def _perejil_ok(adj_outs: int, board_len: int, n_villains: int, overfolder: bool) -> bool:
     """Conditional bluff-raise gate: +8 outs flop / +10 turn, +1/extra villain, -2 vs overfolder."""
     req = KN["perejil_flop"] if board_len == 3 else (KN["perejil_turn"] if board_len == 4 else 99)
@@ -539,6 +573,30 @@ def _perejil_ok(adj_outs: int, board_len: int, n_villains: int, overfolder: bool
     if overfolder:
         req -= KN["perejil_relief"]
     return adj_outs >= req
+
+
+# ── niveles de compromiso preflop (supervivencia de leaderboard) ─────────────────
+def _commit_tier(seats, seat_n, hero_bet, call_chips, eff, bb):
+    """Profundidad del compromiso de fichas → cuánto stack arriesgar.
+    'shallow' (1er 3bet) → 'deep' (4bet) → 'allin' (5bet+/jam o all-in multiway).
+    Devuelve (tier, n_committed)."""
+    thr = max(KN["commit_4bet_bb"] * bb, 0.2 * eff)
+    n_committed = 0
+    for s in seats:
+        if s.get("seatNumber") == seat_n:
+            continue
+        if str(s.get("status") or "").lower() in ("folded", "out", "sittingout"):
+            continue
+        allin = int(s.get("stackChips") or 0) == 0 or "all" in str(s.get("status") or "").lower()
+        if allin or int(s.get("currentBetChips") or 0) >= thr:
+            n_committed += 1
+    risk = call_chips / max(eff, 1)              # fracción de stack efectivo para continuar
+    hb = (hero_bet / bb) if bb else 0            # profundidad de la re-subida del héroe (en bb)
+    if n_committed >= KN["commit_multi_n"] or risk >= KN["commit_allin_frac"] or hb >= KN["commit_5bet_bb"]:
+        return "allin", n_committed
+    if hb >= KN["commit_4bet_bb"] or risk >= KN["commit_deep_frac"]:
+        return "deep", n_committed
+    return "shallow", n_committed
 
 
 # ── reasoning + report ──────────────────────────────────────────────────────────
@@ -598,12 +656,19 @@ def decide(table: dict, deadline_s: float = 10.0,
     texture = _texture(board)
     n_live = sum(1 for s in seats if str(s.get("status") or "").lower() not in ("folded", "out", "sittingout"))
     n_villains = max(1, n_live - 1)
+    hu_now = _HU or (GAME == "tournament" and n_live == 2)   # HU dinámico: en torneo, mesa final de 2 → postflop consciente de posición (IP=botón)
     reads = _villain_reads(table, research_context)
     arc = reads.get("archetype", "UNKNOWN")
     _wtsd = _pct(reads.get("wtsd"))
-    overfolder = arc == "NIT" or (0 < _wtsd < 22 and arc != "STATION")
+    _af = float(reads.get("af") or 0)
+    _bluff = _pct(reads.get("bluffPct"))
     station = arc == "STATION"
     maniac = arc == "MANIAC"
+    # overfolder robusto: NIT, o WTSD bajo PERO pasivo (un agresivo con WTSD bajo barrelea, no foldea)
+    overfolder = arc == "NIT" or (0 < _wtsd < 22 and _af <= 1.8 and arc != "STATION")
+    # lecturas explotadoras (stats que el motor recogía pero NO usaba en la decisión):
+    bluffy = maniac or arc == "LAG" or _af >= 3.0 or _bluff >= 12      # agresivo/bluffer → pagar ancho, no farolearle
+    honest = arc in ("NIT", "TAG") and _af <= 1.3 and 0 <= _bluff < 6  # pasivo/honesto → respetar sus apuestas
 
     # ── PREFLOP ──────────────────────────────────────────────────────────────
     if not board:
@@ -642,6 +707,32 @@ def decide(table: dict, deadline_s: float = 10.0,
                     and str(s.get("status") or "").lower() not in ("folded", "out", "sittingout")]
         raised = (max(opp_bets) if opp_bets else 0) > bb
         can3 = "raise" in avail
+        # ¿OPEN (1ª subida) o RE-subida (4bet+/squeeze)? Si nosotros YA subimos esta calle (hero_bet>bb) y aún
+        # hay que pagar, nos re-subieron; o si el call es enorme (>3.5bb, o ≥18% del stack efectivo) es un
+        # 3bet+/compromiso. Frente a eso NO se re-farolea: solo manos HECHAS premium apilan/continúan.
+        hero_bet = next((int(s.get("currentBetChips") or 0) for s in seats if s.get("seatNumber") == seat_n), 0)
+        eff = _eff_stack(table) or 0
+        facing_reraise = (hero_bet > bb) or (call_chips > 3.5 * bb) or (eff > 0 and call_chips >= 0.18 * eff)
+        if raised and facing_reraise:
+            # Nivel de compromiso: cuanto más profunda la re-subida / más rivales comprometidos, más tight
+            # el rango con el que se apila el stack (supervivencia de leaderboard). Sin SURVIVAL = como antes.
+            if SURVIVAL:
+                tier, n_committed = _commit_tier(seats, seat_n, hero_bet, call_chips, eff, bb)
+                commit_set = {"shallow": _PRE_COMMIT, "deep": _COMMIT_DEEP, "allin": _COMMIT_ALLIN}[tier]
+            else:
+                tier, commit_set = "shallow", _PRE_COMMIT
+            if cls in commit_set and can3:                       # apilar fichas SOLO con premium del tier
+                rng = allowed.get("raiseRange") or {}
+                amt = _clamp(int(call_chips * KN["threebet_mult"]), rng, call_chips * 2, pot + call_chips * 3)
+                if allowed.get("canAllIn") and eff and amt >= 0.6 * eff:     # casi comprometidos → jam directo
+                    amt = int(allowed.get("allInToAmount") or amt)
+                return _act("raise", amt, allowed, f"4bet+ value {cls} ({tier})",
+                            f'{{vr: "premium", ke: "{cls} 4bet+", pp: "{pos}", sr: "{tier}"}}')
+            if cls in commit_set and "call" in avail:
+                return _act("call", None, allowed, f"call re-raise {cls} ({tier})", FALLBACK_REASONING)
+            if "check" in avail:
+                return _act("check", None, allowed, "check vs re-raise", FALLBACK_REASONING)
+            return _act("fold", None, allowed, f"fold {cls} vs re-raise ({tier})", FALLBACK_REASONING)
         bluff3 = (cls in _3BET_BLUFF_BLOCKERS) and overfolder and not station
         if raised and can3 and (cls in _3BET_VALUE or bluff3):
             rng = allowed.get("raiseRange") or {}
@@ -676,17 +767,23 @@ def decide(table: dict, deadline_s: float = 10.0,
     # ── POSTFLOP ─────────────────────────────────────────────────────────────
     board_len = len(board)
     street = ("flop", "turn", "river")[max(0, min(board_len - 3, 2))]
-    eq = _equity(hole, board, n_villains=n_villains, deadline_s=deadline_s)
+    eq = _equity(hole, board, n_villains=n_villains, sims=(400 if deadline_s > 6 else 200), deadline_s=deadline_s)
     strength = _strength(hole, board, texture)
     adj_outs = _adjusted_outs(hole, board, texture)
     spr = _spr(table)
     dyn = _card_dynamic(board, aggressor_is_hero=(research_context or {}).get("aggressor_seat") == seat_n)
     pot_odds = _pme(call_chips, pot) if call_chips else 0.0
     per = _per(adj_outs, board_len)
+    # Equity realista (v1.3): el agresor NO tiene mano aleatoria → descontar al afrontar bet/raise.
+    eq_eff = max(0.0, eq - _range_discount(pot_odds, board_len, bluffy, honest)) if call_chips > 0 else eq
 
     # SPR<=3 commitment: TPTK/overpair (MF) graduates to MMF.
     if spr <= KN["commit_spr"] and strength in ("MF", "MMF"):
-        strength_eff = "MMF"
+        # supervivencia: en bote MULTIWAY no apilar UNA pareja (MF: TPTK/overpair); solo dos pares+ (MMF) commit.
+        if SURVIVAL and n_villains >= 2 and strength == "MF":
+            strength_eff = "MF"
+        else:
+            strength_eff = "MMF"
     else:
         strength_eff = strength
 
@@ -719,7 +816,7 @@ def decide(table: dict, deadline_s: float = 10.0,
         if strength_eff in ("MMF", "MF") or (eq > KN["value_eq"] and not station):
             decision = value_bet()
         elif strength_eff == "MM":
-            if _HU and pos == "SB" and ("bet" in avail or "raise" in avail):   # HU IP (botón): bet fino MM (valor/protección)
+            if ((hu_now and pos == "SB" and not (maniac or bluffy)) or (street == "river" and station)) and ("bet" in avail or "raise" in avail):   # HU IP bet fino MM; o value fino en river vs station
                 decision = value_bet()
             else:
                 decision = _act("check", None, allowed, f"pot control {strength}", FALLBACK_REASONING) \
@@ -727,8 +824,9 @@ def decide(table: dict, deadline_s: float = 10.0,
         else:
             # AIR / draw: Perejil bluff vs weakness; cbet-bluff on overfolder; en HU el botón (IP) c-betea de rango.
             weak_spot = dyn == "static" and not station
-            hu_ip_cbet = _HU and pos == "SB" and texture != "extreme"           # range-cbet IP HU: dry/semi/coord (no en las MUY húmedas) → sube la freq de c-bet
-            if not station and (_perejil_ok(adj_outs, board_len, n_villains, overfolder) or
+            hu_ip_cbet = hu_now and pos == "SB" and texture != "extreme"         # range-cbet IP HU: dry/semi/coord (no en las MUY húmedas) → sube la freq de c-bet
+            river_ok = board_len < 5 or _river_blocker(hole, board)              # en river, solo farol con bloqueador (selección de farol; sin él → give-up)
+            if not station and river_ok and (_perejil_ok(adj_outs, board_len, n_villains, overfolder) or
                                 (overfolder and texture in ("dry", "semi")) or hu_ip_cbet):
                 br = allowed.get("betRange") or {}
                 frac = KN["cbet_bluff_frac"] if (overfolder or hu_ip_cbet) else SIZING[texture][street]
@@ -761,15 +859,18 @@ def decide(table: dict, deadline_s: float = 10.0,
                 decision = _act("call", None, allowed, f"call value {strength}",
                                 _reasoning("call", eq, pot_odds, strength_eff, texture, adj_outs))
         elif strength_eff == "MF":
-            if scary and big_bet and "fold" in avail and not station:
+            if scary and big_bet and "fold" in avail and not station and not bluffy:
                 decision = _act("fold", None, allowed, f"fold MF to scary {dyn}", FALLBACK_REASONING)
-            elif "call" in avail and (eq >= pot_odds + 0.03 or station):
+            elif honest and big_bet and "fold" in avail:                  # no pagar a un honesto que sobreapuesta
+                decision = _act("fold", None, allowed, "fold MF vs honest big bet", FALLBACK_REASONING)
+            elif "call" in avail and (eq_eff >= pot_odds + 0.03 or station or bluffy):   # bluffy → pagar ancho (catch bluffs)
                 decision = _act("call", None, allowed, f"call MF ({arc})",
                                 _reasoning("call", eq, pot_odds, "MF", texture, adj_outs))
             elif "fold" in avail:
                 decision = _act("fold", None, allowed, "fold MF no price", FALLBACK_REASONING)
         elif strength_eff == "MM":
-            if "call" in avail and eq >= pot_odds + 0.02 and not (scary and big_bet):
+            mm_margin = -0.03 if (bluffy or station) else (0.08 if honest else 0.02)   # lectura: ancho vs bluffer, estrecho vs honesto
+            if "call" in avail and eq_eff >= pot_odds + mm_margin and not (scary and big_bet and not bluffy):
                 decision = _act("call", None, allowed, f"showdown MM ({arc})",
                                 _reasoning("call", eq, pot_odds, "MM", texture, adj_outs))
             else:
@@ -777,22 +878,34 @@ def decide(table: dict, deadline_s: float = 10.0,
                     if "fold" in avail else _act("check", None, allowed, "check MM", FALLBACK_REASONING)
         else:
             # MD / AIR with possible draw: PER vs PME, then Perejil bluff-raise.
-            if per >= pot_odds and "call" in avail:
+            # Anti-guerra de re-subidas (postflop): si YA apostamos esta calle y nos re-suben (o la apuesta es
+            # enorme), NO se re-faroleá con aire — la acción del rival manda sobre la etiqueta del HUD. Y el
+            # bluff-raise de explotación exige un mínimo de equity (≥4 outs ajustadas), nunca aire de 0 outs.
+            hero_bet_st = next((int(s.get("currentBetChips") or 0) for s in (table.get("seats") or [])
+                                if s.get("seatNumber") == seat_n), 0)
+            reraise_war = hero_bet_st > 0 or call_chips >= 0.5 * pot
+            if (bluffy and strength_eff == "MD" and not reraise_war and not big_bet
+                    and "call" in avail and eq_eff >= pot_odds - 0.02):   # bluff-catch a agresivos con MD/A-alto
+                decision = _act("call", None, allowed, f"bluff-catch MD vs {arc}",
+                                _reasoning("call", eq, pot_odds, "MD", texture, adj_outs))
+            elif per >= pot_odds and "call" in avail:
                 decision = _act("call", None, allowed, f"draw call {adj_outs}o PER{int(per*100)}",
                                 _reasoning("call", per, pot_odds, "draw", texture, adj_outs))
-            elif (not station and "raise" in avail and
+            elif (not station and not bluffy and not reraise_war and "raise" in avail and
                   _perejil_ok(adj_outs, board_len, n_villains, overfolder)):
                 rng = allowed.get("raiseRange") or {}
                 amt = _clamp(int((pot + call_chips) * 0.8) + call_chips, rng, call_chips * 2, pot * 3)
                 decision = _act("raise", amt, allowed, f"perejil bluff-raise {adj_outs}o ({arc})",
                                 _reasoning("raise", 0, pot_odds, "AIR", texture, adj_outs))
-            elif overfolder and "raise" in avail and texture in ("dry", "semi") and not station:
+            elif (overfolder and not reraise_war and adj_outs >= 4 and "raise" in avail
+                  and texture in ("dry", "semi") and not station):
                 rng = allowed.get("raiseRange") or {}
                 amt = _clamp(int((pot + call_chips) * 0.7) + call_chips, rng, call_chips * 2, pot * 3)
-                decision = _act("raise", amt, allowed, f"bluff-raise vs overfold ({arc})",
+                decision = _act("raise", amt, allowed, f"bluff-raise vs overfold {adj_outs}o ({arc})",
                                 _reasoning("raise", 0, pot_odds, "AIR", texture, adj_outs))
             else:
-                decision = _act("fold", None, allowed, f"fold {strength} PER<PME", FALLBACK_REASONING)
+                decision = _act("fold", None, allowed, f"fold {strength} (PER<PME, war={int(reraise_war)})",
+                                FALLBACK_REASONING)
 
     if decision is None:  # safety net
         if "check" in avail:

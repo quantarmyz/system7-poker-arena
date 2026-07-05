@@ -224,15 +224,30 @@ def main():
         _log("no active competition to join (set ARENA_COMPETITION_ID or wait). exiting.")
         return
     _log(f"strategy={os.environ.get('S7_STRAT') or 'std'} competition={COMP}")
+    try:
+        s7_stats.set_meta("active_comp", COMP)   # el tracker sidecar sigue la comp por meta (rollover-safe)
+    except Exception:
+        pass
 
     hands_done = 0
     rebuys = 0
+    try:                    # anclar al rebuyCount REAL del servidor → sobrevive re-deploys y rebuys manuales (la curva de equity descuenta TODOS los buy-ins, no solo los de este run)
+        _rs0 = c.get(f"/texas/rebuy-status?competitionId={COMP}")
+        if isinstance(_rs0, dict) and _rs0.get("rebuyCount") is not None:
+            rebuys = int(_rs0["rebuyCount"])
+            _log(f"rebuys ancladas al servidor: {rebuys}")
+    except Exception:
+        pass
     last_hole = {}          # tableId -> hole string (hand-change detector)
     last_seen_table = 0.0
     last_join = 0.0
     last_beat = 0.0
     last_stack = None
     dumped = False
+    last_eq_pt = [None, None]   # [hands, stack] del último punto de equity → en idle no se loguea
+    ROLL_IDLE = int(os.environ.get("S7_ROLLOVER_IDLE_S", "600"))
+    t_start = time.time()
+    last_roll = time.time()
 
     ASYNC = os.environ.get("S7_PVP_ASYNC", "") not in ("", "0", "false", "False", "no")
     MARGIN = float(os.environ.get("S7_PVP_SUBMIT_MARGIN", "3.0"))
@@ -309,8 +324,9 @@ def main():
             return r
         except ArenaError as e:
             if e.status == 402:
-                _log(f"JOIN 402 entry fee (unexpected for Playground): {e.body} — stopping")
-                raise SystemExit(3)
+                _log(f"JOIN 402 x402 (registra la entrada del torneo en dev.fun; el sponsor-ticket está fondeado): {str(e.body)[:200]} — back-off 30s, auto-une al registrarse")
+                time.sleep(30)   # back-off: la entrada x402 (sponsored) se confirma en la web dev.fun; NO morir ni spamear → se auto-une cuando esté registrada
+                return None
             if e.status == 403:
                 try:
                     cs = c.get("/auth/claim/status")
@@ -333,12 +349,44 @@ def main():
             # opportunistic rebuy if available
             try:
                 rs = c.get(f"/texas/rebuy-status?competitionId={COMP}")
-                if isinstance(rs, dict) and (rs.get("canRebuy") or rs.get("needed") or rs.get("available")):
+                if isinstance(rs, dict) and rs.get("canRebuyNow"):   # campo REAL de la API (antes miraba canRebuy/needed/available → nunca rebuy → se quedaba busteado)
                     c.post("/texas/rebuy", {"competitionId": COMP})
                     rebuys += 1
                     _log(f"rebuy #{rebuys}")
             except ArenaError:
                 pass
+
+        # Watchdog de rollover: mucho tiempo sin ver mesa = la temporada pudo morir → re-descubrir
+        # la competición activa (_resolve_comp ya ignora la forzada si no está viva) y re-anclar.
+        if time.time() - max(last_seen_table, t_start) > ROLL_IDLE and time.time() - last_roll > 300:
+            last_roll = time.time()
+            try:
+                _nc = _resolve_comp(c)
+            except Exception:
+                _nc = None
+            if _nc and _nc != COMP:
+                _log(f"season rollover: {COMP} -> {_nc}; re-anclando estado")
+                COMP = _nc
+                os.environ["ARENA_COMPETITION_ID"] = _nc     # _features etiqueta decisions por env
+                try:
+                    s7_stats.set_meta("active_comp", _nc)    # realinea el tracker sidecar
+                except Exception:
+                    pass
+                rebuys = 0
+                try:                                          # re-anclar al rebuyCount del servidor en la comp nueva
+                    _rs = c.get(f"/texas/rebuy-status?competitionId={COMP}")
+                    if isinstance(_rs, dict) and _rs.get("rebuyCount") is not None:
+                        rebuys = int(_rs["rebuyCount"])
+                except Exception:
+                    pass
+                hands_done = 0
+                last_hole.clear()
+                last_stack = None
+                ev_state["adj"] = 0.0
+                allin_ctx.clear()
+                last_eq_pt[:] = [None, None]
+                _meta_flag.pop("bb", None)                   # recapturar big_blind de la season nueva
+                ensure_joined()
 
         try:
             pending = c.get(f"/texas/pending-actions?competitionId={COMP}")
@@ -481,9 +529,11 @@ def main():
                     if len(allin_ctx) > 300:                                 # poda manos que nunca casaron un replay
                         for _k in list(allin_ctx)[:-150]:
                             allin_ctx.pop(_k, None)
-                if _rl and last_stack is not None:
-                    _net = last_stack - 1000 * (1 + rebuys)         # neto REAL vs bankroll inicial + rebuys
-                    s7_stats.log_equity(_rl, hands_done, _net, _net + int(round(ev_state["adj"])))  # raw=real, adj=EV
+                if _rl and last_stack is not None and [hands_done, last_stack] != last_eq_pt:
+                    _net = last_stack - 1000                        # neto POR ENTRADA (relativo al buy-in actual; cada re-entry parte de ~0)
+                    s7_stats.log_equity(_rl, hands_done, _net, _net + int(round(ev_state["adj"])), reentry=rebuys,
+                                        competition_id=COMP)        # una serie por re-entry, acotada a su temporada
+                    last_eq_pt[:] = [hands_done, last_stack]        # idle (sin manos ni cambio de stack) → no ensuciar la curva
             except Exception:
                 pass
             if ASYNC:

@@ -5,7 +5,9 @@ const jget = async u => { try { return await (await fetch(_g(u))).json(); } catc
 const jpost = async (u, b) => { b = Object.assign({ game: CTXGAME }, b || {}); try { return await (await fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) })).json(); } catch (e) { return { error: String(e) }; } };
 const POS6 = ["UTG", "MP", "CO", "BTN", "SB", "BB"];
 const BUCKETS = ["deep", "mid", "short", "push"];
-const COMPNAMES = { eval: "Eval S1", seed_poker_eval_s1: "Eval S1", cmqf827h30u7dfca3x2aqvzjv: "Playground S3", cmqggiv9k37am11ydmppz466e: "Tournament S2" };
+const COMPNAMES = { eval: "Eval S1", seed_poker_eval_s1: "Eval S1", cmqf827h30u7dfca3x2aqvzjv: "Playground S3", cmqggiv9k37am11ydmppz466e: "Tournament S2",
+  cmqma3c2d3sgjnq1qduj0mgv7: "Playground S4 (HU)", cmquozxxm2vmlt6mn6j7gzgdf: "Playground S5", cmr4ou75y1s6vt9h91hqybbsd: "Playground S6",
+  cmqnr6x9q9dclnq1qekuj3jde: "Tournament S3", cmr4otnmu1ru5sc8qlhpt3mgg: "Tournament S5", cmr3n8tft01nilecm1u5jlny7: "HU Ladder S1" };
 const compName = c => COMPNAMES[c] || c || "";   // id de competición → nombre legible
 
 function app() {
@@ -15,6 +17,7 @@ function app() {
     evalForm: { agent: "", total: 6, maxc: 2, group: "" }, evalMsg: "", runs: [], groups: [],
     builder: null, report: null, task: "", taskData: null, taskLog: "",
     coachForm: { agent: "", window: "" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
+    handsScope: "session", coachHands: null, handsCoachText: "", selectedHands: [],
     prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
     modalHand: null, modalOpp: null, step: 0, embed: true, eqOpt: { ev: true, off: {} },
     settings: {}, keyInput: {}, baseInput: {}, liveModel: "", defModel: "", settingsMsg: "", settingsMsg2: "",
@@ -32,12 +35,13 @@ function app() {
     async tick() {
       const d = await jget("/api/state");
       this.live = !d.error; if (!d.error) this.state = d;
-      if (this.zone === "production") { this.loadProd(); this.loadHands(); this.loadRank(); this.loadSession(); }
+      // con deploy activo, manos ya las refresca el interval de 2s; sesión/ranking van en el de 30s + clicks
+      if (this.zone === "production") { this.loadProd(); if (!((this.prod || {}).active || []).length) this.loadHands(); }
     },
     setZone(z) {
       this.zone = z;
       if (z === "lab") { this.loadAgents(); this.loadRuns(); this.loadGroups(); }
-      if (z === "coach") { this.loadAgents(); this.loadCoach(); }
+      if (z === "coach") { this.loadAgents(); this.loadCoach(); this.loadCoachHands(); }
       if (z === "production") { this.loadProd(); this.loadCompetitions(); this.loadRank(); this.loadHands(); this.loadOpponents(); this.loadSession(); this.loadAccount(); }
       if (z === "settings") { this.loadSettings(); }
     },
@@ -257,6 +261,37 @@ function app() {
       return stale + `${panel}<table class="list"><thead><tr><th>métrica</th><th>tú</th><th>óptimo</th><th>✓</th><th>nota</th></tr></thead><tbody>${vsopt}</tbody></table>
         <div style="margin-top:10px">${adv}</div>`;
     },
+    async loadCoachHands() { this.coachHands = await jget("/api/coach/hands?scope=" + this.handsScope); this.handsCoachText = ""; this.selectedHands = []; },
+    renderCoachHands() {
+      const d = this.coachHands;
+      if (!d) return '<div class="empty">cargando…</div>';
+      if (d.error) return `<div class="neg">${esc(d.error)}</div>`;
+      if (!d.n) return '<div class="empty">sin manos con resultado en esta vista todavía</div>';
+      const row = h => `<tr class="clk" data-key="${encodeURIComponent(h.key)}"><td style="cursor:pointer;text-align:center;width:22px;font-size:15px" data-selhand="${esc(h.key)}">${this.selectedHands.includes(h.key) ? "☑" : "☐"}</td><td class="dim">${tt(h.ts)}</td><td>${esc(h.pos || "")}</td><td>${chs(h.hole) || "—"}</td><td>${chs(h.board) || "—"}</td><td class="dim" style="font-size:11px">${esc(h.moves || "")}</td><td class="num"><b class="${h.delta >= 0 ? "pos" : "neg"}">${h.delta >= 0 ? "+" : ""}${h.delta}</b></td></tr>`;
+      const tbl = (title, hs) => `<div style="flex:1;min-width:340px"><div class="dim" style="margin-bottom:4px">${title}</div><table class="list"><thead><tr><th></th><th>hora</th><th>pos</th><th>mano</th><th>board</th><th>línea</th><th class="num">result</th></tr></thead><tbody>${(hs || []).map(row).join("")}</tbody></table></div>`;
+      return `<div class="dim" style="font-size:11px;margin-bottom:6px">☐ marca para seleccionar · clic en la fila → detalle · <b>${d.scope === "session" ? "última sesión" : "lifetime"}</b> · ${d.n} manos con resultado</div><div class="row" style="align-items:flex-start;gap:20px">${tbl("🟢 10 más rentables", d.top)}${tbl("🔴 10 menos rentables", d.bottom)}</div>`;
+    },
+    onCoachHandsClick(e) {
+      const sel = e.target.closest("[data-selhand]");
+      if (sel) { const k = sel.dataset.selhand, i = this.selectedHands.indexOf(k); if (i >= 0) this.selectedHands.splice(i, 1); else this.selectedHands.push(k); return; }
+      const r = e.target.closest("[data-key]");
+      if (r) this.openHand(decodeURIComponent(r.dataset.key));
+    },
+    handsCoachLLM() {
+      const d = this.coachHands || {};
+      let keys = this.selectedHands.slice();
+      if (!keys.length) keys = [...(d.top || []), ...(d.bottom || [])].map(h => h.key);
+      if (!keys.length) { this.handsCoachText = '<span class="dim">no hay manos</span>'; return; }
+      let n = 0; this.handsCoachText = `⏳ analizando ${keys.length} manos…`;
+      const q = "/api/coach/hands-llm?keys=" + keys.map(encodeURIComponent).join(",");
+      const poll = async () => {
+        const r = await jget(q);
+        if (r.error) { this.handsCoachText = `<span class="neg">${esc(r.error)}</span>`; return; }
+        if (r.running) { n++; this.handsCoachText = `⏳ analizando ${keys.length} manos… (${n * 4}s)`; if (n < 75) setTimeout(poll, 4000); return; }
+        this.handsCoachText = (r.model ? '<span class="dim">🧠 analizado con ' + esc(r.model) + '</span>\n\n' : '') + esc(r.text || "");
+      };
+      poll();
+    },
     coachLLM() {
       const w = this.coachForm.window; let n = 0; this.coachText = "⏳ pidiendo análisis a M3…";
       const poll = async () => { const d = await jget("/api/coach/llm?window=" + w);
@@ -300,7 +335,7 @@ function app() {
         <td class="num">${e.score != null ? e.score : "—"}</td></tr>`).join("");
       return head + `<table class="list" style="margin-top:8px"><thead><tr><th>evento</th><th class="num">posición</th><th class="num">score</th></tr></thead><tbody>${evs}</tbody></table>`;
     },
-    async loadSession() { this.prodSession = await jget("/api/production/session?label="); },   // siempre unificado (temporada actual, todos los deploys)
+    async loadSession() { this.prodSession = await jget("/api/production/session?label=" + encodeURIComponent(this.prodSel || "")); },   // sin selección = unificado (temporada actual); el 👁 del Ranking fija prodSel
     renderProdControl() {
       const p = this.prod || {};
       const act = (p.active || []).map(a => `<div class="row" style="margin:4px 0"><span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>${a.continuous ? ` <span class="pill amber">continuo · la cola espera</span>` : ""}
@@ -321,12 +356,12 @@ function app() {
     },
     renderLive() {
       const p = this.prod || {}, act = p.active || [], br = p.bankroll;
-      if (!act.length) return '<div class="empty">ningún agente jugando ahora — despliega uno arriba</div>';
-      return act.map(a => `<div class="row" style="margin:6px 0;align-items:center">
+      const hdr = `<div class="dim" style="margin-bottom:6px">motor heurístico <b>v${esc(p.heur_version || "1.0")}</b></div>`;
+      if (!act.length) return hdr + '<div class="empty">ningún agente jugando ahora — despliega uno arriba</div>';
+      return hdr + act.map(a => `<div class="row" style="margin:6px 0;align-items:center">
         <span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>${a.continuous ? ` <span class="pill amber">continuo</span>` : ""}
         <span class="dim">· ${(a.hands || 0).toLocaleString()} manos</span>${(a.continuous && br && br.stack != null) ? ` <span class="dim">· stack <b>${br.stack}</b> · ${br.rebuys} rebuys</span>` : ""}
         <span class="spacer"></span>
-        <button class="btn sm" data-sel="${esc(a.label)}" data-selname="${esc(a.agent || a.label)}">👁 ver</button>
         <button class="btn sm destructive" data-stopprod="${esc(a.unit)}">parar</button>
         <button class="btn sm" data-claim="${esc(a.label)}">🏆 reclamar</button></div>`).join("");
     },
@@ -335,7 +370,9 @@ function app() {
       if (!d) return '<div class="empty">cargando…</div>';
       if (d.error) return `<div class="neg">${esc(d.error)}</div>`;
       const kpi = (l, v) => `<div class="kpi" style="text-align:left"><div class="l">${l}</div><div class="v" style="font-size:17px">${v}</div></div>`;
-      const tag = '<span class="dim">temporada actual · todos los deploys unificados</span>';
+      const tag = this.prodSel
+        ? `<span class="pill amber">viendo «${esc(this.prodSelName || this.prodSel)}»</span> <button class="btn sm flat" data-selall="1">✕ todos</button>`
+        : '<span class="dim">temporada actual · todos los deploys unificados</span>';
       const stats = `<div class="row" style="gap:14px;align-items:center;margin-bottom:6px">${tag}<span class="spacer"></span>
         ${kpi("manos", (d.hands || 0).toLocaleString())}${kpi("decisiones", (d.decisions || 0).toLocaleString())}${kpi("M3 %", (d.m3pct || 0) + "%")}
         ${kpi("bb/100 REAL", d.agg && d.agg.mean != null ? (d.agg.mean >= 0 ? "+" : "") + d.agg.mean : "—")}${kpi("bb/100 EV", d.agg && d.agg.adj != null ? (d.agg.adj >= 0 ? "+" : "") + d.agg.adj : "—")}</div>`;

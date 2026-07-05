@@ -62,7 +62,12 @@ def init():
             ts REAL, run_label TEXT, agent_id TEXT, engine TEXT, hands INTEGER,
             adjusted_bb100 REAL, raw_bb100 REAL, raw_chip_delta INTEGER, m3_calls INTEGER, note TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS equity(
-            ts REAL, run_label TEXT, hands INTEGER, raw_chips REAL, adj_chips REAL)""")
+            ts REAL, run_label TEXT, hands INTEGER, raw_chips REAL, adj_chips REAL, reentry INTEGER DEFAULT 0)""")
+        if "reentry" not in {r[1] for r in c.execute("PRAGMA table_info(equity)")}:
+            c.execute("ALTER TABLE equity ADD COLUMN reentry INTEGER DEFAULT 0")
+        if "competition_id" not in {r[1] for r in c.execute("PRAGMA table_info(equity)")}:
+            c.execute("ALTER TABLE equity ADD COLUMN competition_id TEXT")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_equity_comp ON equity(run_label, competition_id)")
         c.execute("""CREATE TABLE IF NOT EXISTS hand_events(
             hand_key TEXT PRIMARY KEY, ts REAL, seat INTEGER, hole TEXT, board TEXT,
             events TEXT, n_events INTEGER, seats TEXT)""")
@@ -125,11 +130,13 @@ def log_run(run_label, agent_id, engine, hands, adjusted_bb100, raw_bb100, raw_c
                    adjusted_bb100, raw_bb100, raw_chip_delta, m3_calls, note))
 
 
-def log_equity(run_label, hands, raw_chips, adj_chips):
-    """Cumulative actual (raw) vs EV (variance-adjusted) chips at a given hand count."""
+def log_equity(run_label, hands, raw_chips, adj_chips, reentry=0, competition_id=""):
+    """Actual (raw) vs EV chips at a hand count. raw_chips = neto POR ENTRADA; reentry = índice de re-entry.
+    competition_id acota cada punto a su temporada (los labels de Eval/bench van sin ella)."""
     with _conn() as c:
-        c.execute("INSERT INTO equity VALUES(?,?,?,?,?)",
-                  (time.time(), run_label, hands, raw_chips, adj_chips))
+        c.execute("INSERT INTO equity(ts,run_label,hands,raw_chips,adj_chips,reentry,competition_id) "
+                  "VALUES(?,?,?,?,?,?,?)",
+                  (time.time(), run_label, hands, raw_chips, adj_chips, int(reentry or 0), competition_id or ""))
 
 
 def log_hand_events(hand_key, seat, hole, board, events, seats=None):

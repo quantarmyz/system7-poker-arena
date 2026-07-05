@@ -207,7 +207,9 @@ def lab_report(agent):
 _QUEUE_PATH = os.path.join(_DATA, "prod_queue.json")
 _DEPLOYS_PATH = os.path.join(_DATA, "prod_deploys.json")
 _GROUPS_PATH = os.path.join(_DATA, "lab_groups.json")
+_RESUME_PATH = os.path.join(_DATA, "prod_resume.json")   # estado deseado {game:{agent,competition}} → sobrevive reboots/crashes del subproceso PvP
 _qlock = threading.Lock()
+_last_resume = {}                                        # game -> ts del último relanzamiento (throttle anti-bucle)
 
 
 def _jload(path, default):
@@ -245,12 +247,13 @@ def _any_key():
     return None
 
 
-def production_competitions():
-    """Eventos dev.fun jugables: Eval + competiciones activas (torneos/playground) vía list-active."""
-    out = []                                     # producción bloqueada a la Playground activa (S4): sin Eval ni torneos
+def production_competitions(game=None):
+    """Competición jugable del game activo: Playground (cash) o Tournament (torneo) vía list-active."""
+    want = "tournament" if str(game) == "tournament" else "playground"
+    out = []                                     # producción bloqueada a la competición activa del game (sin Eval)
     key = _any_key()
     if not key:
-        return {"competitions": out, "note": "sin credenciales para listar torneos"}
+        return {"competitions": out, "note": "sin credenciales para listar"}
     try:
         import sys as _s
         _s.path.insert(0, os.path.join(HERE, "examples"))
@@ -266,27 +269,29 @@ def production_competitions():
                 continue
             nm = str(x.get("name", "")) or str(x.get("id"))
             paid = bool(x.get("buyIn") or x.get("entryFee"))
-            if "playground" not in nm.lower():   # SOLO la Playground (excluye Eval, torneos, etc.)
+            if want not in nm.lower():           # SOLO la competición del game (playground | tournament)
                 continue
-            out.append({"id": x.get("id"), "name": nm, "kind": "playground", "paid": paid})
+            out.append({"id": x.get("id"), "name": nm, "kind": want, "paid": paid})
     except Exception as e:
         out.append({"id": "", "name": "(no se pudieron listar torneos: %s)" % str(e)[:80], "kind": "error", "paid": False})
     return {"competitions": out}
 
 
-_ACTIVE_CACHE = {"ts": 0.0, "ids": {}, "pg": None}
+_ACTIVE_CACHE = {"cash": {"ts": 0.0, "ids": {}, "c": None}, "tournament": {"ts": 0.0, "ids": {}, "c": None}}
 
 
-def _active_comps():
-    """({id: nombre} de competiciones activas, dict {id,name} de la Playground viva) — cacheado 120s (anti-429)."""
+def _active_comps(game="cash"):
+    """({id: nombre} activas, dict {id,name} de la competición VIVA del game — Playground o Tournament) — cacheado 120s (anti-429)."""
+    g = "tournament" if str(game) == "tournament" else "cash"
+    ca = _ACTIVE_CACHE[g]
     now = time.time()
-    if _ACTIVE_CACHE["ts"] and now - _ACTIVE_CACHE["ts"] < 120:
-        return _ACTIVE_CACHE["ids"], _ACTIVE_CACHE["pg"]
-    comps = production_competitions().get("competitions") or []
+    if ca["ts"] and now - ca["ts"] < 120:
+        return ca["ids"], ca["c"]
+    comps = production_competitions(g).get("competitions") or []
     ids = {c["id"]: c["name"] for c in comps if c.get("id") and c.get("kind") not in ("eval", "error")}
-    pg = next(({"id": c["id"], "name": c["name"]} for c in comps if c.get("kind") == "playground" and c.get("id")), None)
-    _ACTIVE_CACHE.update(ts=now, ids=ids, pg=pg)
-    return ids, pg
+    c0 = next(({"id": c["id"], "name": c["name"]} for c in comps if c.get("kind") in ("playground", "tournament") and c.get("id")), None)
+    ca.update(ts=now, ids=ids, c=c0)
+    return ids, c0
 
 
 def _prod_active():
@@ -304,7 +309,7 @@ def _prod_launch(agent, competition):
         return {"error": "perfil no encontrado"}
     import secrets as _sec
     game = p.get("game", "cash")
-    env = {"S7_STATS_DB": _dbpath(game)}
+    env = {"S7_STATS_DB": _dbpath(game), "S7_PVP_LOCK": "/data/.pvp-%s.lock" % game}   # lock por game → Playground (cash) y Tournament (torneo) conviven
     env.update(s7_agents.env_for(p))
     label = "prod-" + _sec.token_hex(4)
     if competition in ("eval", "seed_poker_eval_s1", ""):
@@ -357,19 +362,28 @@ def _prod_launch(agent, competition):
     d[label] = {"agent": agent, "competition": competition, "compname": compname, "game": game,
                 "run_label": env.get("S7_RUN_LABEL") or label, "ts": time.time()}
     _jwrite(_DEPLOYS_PATH, d)
+    if _is_continuous(competition):                      # PvP continuo → registra estado deseado para auto-reanudar tras reboot/crash
+        try:
+            r = _jload(_RESUME_PATH, {})
+            r[game] = {"agent": agent, "competition": competition}
+            _jwrite(_RESUME_PATH, r)
+        except Exception:
+            pass
     return {"ok": True, "unit": unit, "label": label, "agent": agent}
 
 
 def production_deploy(body):
     agent = str(body.get("agent", "")).strip().lower()
     comp = str(body.get("competition", "") or "")
-    _ids, _pg = _active_comps()                  # bloqueo: producción SOLO contra la Playground activa (S4)
-    if _pg and _pg.get("id"):
-        comp = _pg["id"]
-    if not s7_agents.load(agent):
+    p = s7_agents.load(agent)
+    if not p:
         return {"error": "perfil no encontrado"}
+    _ids, _c = _active_comps(p.get("game", "cash"))   # bloqueo: contra la competición ACTIVA del game del perfil (Playground=cash | Tournament=torneo)
+    if _c and _c.get("id"):
+        comp = _c["id"]
     deploys = _jload(_DEPLOYS_PATH, {})
     active = _prod_active()
+    active_game = [j for j in active if deploys.get(j["label"], {}).get("game", "cash") == p.get("game", "cash")]   # concurrencia POR GAME → Playground (cash) y Tournament (torneo) conviven
     # dedupe: mismo agente+evento ya activo o en cola → no duplicar
     for j in active:
         m = deploys.get(j["label"], {})
@@ -378,20 +392,21 @@ def production_deploy(body):
     if any(it.get("agent") == agent and str(it.get("competition") or "") == comp
            for it in _jload(_QUEUE_PATH, [])):
         return {"error": "ese agente+evento ya está en la cola"}
-    if active:                                               # 1 a la vez → a la cola
+    if active_game:                                          # 1 por GAME → a la cola (cash y torneo conviven)
         with _qlock:
             q = _jload(_QUEUE_PATH, [])
             q.append({"agent": agent, "competition": comp, "ts": time.time()})
             _jwrite(_QUEUE_PATH, q)
-        warn = ("el activo es un evento continuo (PvP/Playground): la cola no avanzará hasta que lo pares"
-                if any(_is_continuous(deploys.get(j["label"], {}).get("competition")) for j in active) else None)
+        warn = ("el activo de este game es un evento continuo (PvP): la cola no avanzará hasta que lo pares"
+                if any(_is_continuous(deploys.get(j["label"], {}).get("competition")) for j in active_game) else None)
         return {"ok": True, "queued": True, "agent": agent, "queue_len": len(q), "warn": warn}
     return _prod_launch(agent, comp)
 
 
 def production_status():
     deploys = _jload(_DEPLOYS_PATH, {})
-    jobs = [j for j in s7_jobs.list_jobs() if j["label"].startswith("prod-")]
+    _g = curgame()                               # cada tab (CASH/TORNEO) ve solo sus deploys
+    jobs = [j for j in s7_jobs.list_jobs() if j["label"].startswith("prod-") and deploys.get(j["label"], {}).get("game", "cash") == _g]
     active = [j for j in jobs if j["state"] == "active"]
     snap = None
     hpl = {}
@@ -413,8 +428,14 @@ def production_status():
                 "agent": m.get("agent"), "competition": m.get("compname") or m.get("competition"),
                 "continuous": _is_continuous(m.get("competition")),
                 "hands": hpl.get(m.get("run_label") or j["label"], 0)}   # por run_label del deploy (Playground agrupado)
+    try:
+        import decide_system7 as _DS
+        _hv = getattr(_DS, "VERSION", "1.0")
+    except Exception:
+        _hv = "1.0"
     return {"running": bool(active), "active": [mk(j) for j in active],
-            "jobs": [mk(j) for j in jobs], "queue": _jload(_QUEUE_PATH, []), "bankroll": snap}
+            "jobs": [mk(j) for j in jobs], "queue": _jload(_QUEUE_PATH, []),
+            "bankroll": snap, "heur_version": _hv}
 
 
 def production_stop(body):
@@ -427,6 +448,15 @@ def production_stop(body):
         return {"error": str(e)}
     try:                                    # parar también el tracker sidecar de ese deploy
         s7_jobs.stop(unit.replace("arena-run-prod-", "arena-run-tracker-prod-"))
+    except Exception:
+        pass
+    try:                                    # stop manual = intención de parar → limpia el estado deseado de ese game (no resucita tras reboot)
+        lbl = unit.replace("arena-run-", "")
+        g = (_jload(_DEPLOYS_PATH, {}).get(lbl) or {}).get("game", "cash")
+        r = _jload(_RESUME_PATH, {})
+        if g in r:
+            r.pop(g, None)
+            _jwrite(_RESUME_PATH, r)
     except Exception:
         pass
     return {"ok": True}
@@ -578,6 +608,7 @@ def production_session(label=""):
         c = _ro()
     except Exception as e:
         return {"error": str(e)}
+    _cc = None
     if label:
         cond, A = "run_label like ?", (label + "%",)
     else:                                   # sin label: unificar al agente autenticado, en su competición/temporada actual
@@ -625,7 +656,7 @@ def production_session(label=""):
         runs = []
     bbs = [r[0] for r in runs if r[0] is not None and (r[1] or 0) >= 400]
     agg = _ci(bbs)
-    if not bbs and hands >= 30:                  # sin runs de Eval → win rate EN VIVO desde la equity (raw + EV), neto ACUMULADO
+    if not bbs and hands >= 30:                  # sin runs de Eval → win rate EN VIVO desde la equity (raw + EV)
         try:
             mb = c.execute("select v from meta where k='big_blind'").fetchone()
             try:
@@ -633,9 +664,17 @@ def production_session(label=""):
             except Exception:
                 bb = 0.0
             bb = bb or 10.0                                  # 1000 de buy-in ≈ 100bb → bb=10 por defecto
-            last = c.execute("select raw_chips, adj_chips from equity where run_label like ? order by ts desc limit 1",
-                             ((label or "playground") + "%",)).fetchone()
-            tr, ta = (last[0] or 0, last[1] or 0) if last else (0, 0)   # neto ACUMULADO = último raw (el stack del Arena persiste entre reinicios; NO sumar segmentos)
+            if label:
+                last = c.execute("select raw_chips, adj_chips, reentry from equity where run_label like ? "
+                                 "order by ts desc limit 1", (label + "%",)).fetchone()
+            else:                                            # misma season que las manos: playground acotado a la comp actual
+                last = c.execute("select raw_chips, adj_chips, reentry from equity where run_label='playground' "
+                                 "and competition_id=? order by ts desc limit 1", (_cc[0],)).fetchone() \
+                    if (_cc and _cc[0]) else None
+            # neto TOTAL de la season = raw (neto POR ENTRADA, ver run_pvp) − 1000×rebuys: cada re-entry quemó un buy-in.
+            # El stack del Arena persiste entre reinicios → último punto, NO sumar segmentos.
+            _re = int(last[2] or 0) if last else 0
+            tr, ta = ((last[0] or 0) - 1000 * _re, (last[1] or 0) - 1000 * _re) if last else (0, 0)
             agg = {"n_evals": 1, "live": True, "bb": bb, "ci": None,
                    "mean": round((tr / bb) / hands * 100, 1),
                    "adj": round((ta / bb) / hands * 100, 1)}
@@ -721,10 +760,45 @@ def queue_tick_once():
     _prod_launch(item.get("agent"), item.get("competition"))
 
 
+def resume_tick_once():
+    """Auto-reanuda el PvP continuo deseado (prod_resume.json) si su proceso murió
+    (reboot del host, recreación del contenedor o crash del subproceso). 1 por game;
+    respeta el stop manual (que borra la entrada) y throttlea para no entrar en bucle."""
+    r = _jload(_RESUME_PATH, {})
+    if not r:
+        return
+    deploys = _jload(_DEPLOYS_PATH, {})
+    active_games = {deploys.get(j["label"], {}).get("game", "cash") for j in _prod_active()}
+    now = time.time()
+    for game, want in list(r.items()):
+        agent = (want or {}).get("agent")
+        if not agent or game in active_games:                 # ya hay un PvP vivo de ese game
+            continue
+        if now - _last_resume.get(game, 0) < 90:              # throttle: no relanzar el mismo game más de 1x/90s
+            continue
+        comp = (want or {}).get("competition")
+        try:                                                  # los ids de competición rotan por temporada → resolver la viva actual
+            _ids, _c = _active_comps(game)
+            if _c and _c.get("id"):
+                comp = _c["id"]
+        except Exception:
+            pass
+        _last_resume[game] = now
+        try:
+            res = _prod_launch(agent, comp)
+            print("[s7-resume] re-lanzado %s (%s) -> %s" % (agent, game, res.get("label") or res.get("error")), flush=True)
+        except Exception as e:
+            print("[s7-resume] fallo al reanudar %s (%s): %s" % (agent, game, str(e)[:200]), flush=True)
+
+
 def queue_loop():
     while True:
         try:
-            queue_tick_once()
+            resume_tick_once()      # 1º reanuda el PvP continuo caído (reboot/crash)
+        except Exception:
+            pass
+        try:
+            queue_tick_once()       # 2º procesa la cola de eventos (1 a la vez)
         except Exception:
             pass
         time.sleep(8)

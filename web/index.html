@@ -96,6 +96,16 @@
       </h3>
       <div class="body" x-html="renderCoach()"></div>
     </div>
+    <div class="card col-12">
+      <h3>🃏 Manos — coaching mano a mano
+        <span class="spacer"></span>
+        <label class="toggle"><input type="radio" name="hsc" value="session" x-model="handsScope" @change="loadCoachHands()"> última sesión</label>
+        <label class="toggle"><input type="radio" name="hsc" value="lifetime" x-model="handsScope" @change="loadCoachHands()"> lifetime</label>
+        <button class="btn suggested" @click="handsCoachLLM()" x-text="'🧠 analizar ' + (selectedHands.length ? selectedHands.length + ' sel.' : 'todas')"></button>
+      </h3>
+      <div class="body" @click="onCoachHandsClick($event)" x-html="renderCoachHands()"></div>
+      <div style="margin-top:10px;white-space:pre-wrap;font-size:13px;line-height:1.5" x-html="handsCoachText"></div>
+    </div>
     <div class="card col-6">
       <h3>Coach IA (M3)</h3>
       <div class="body">
