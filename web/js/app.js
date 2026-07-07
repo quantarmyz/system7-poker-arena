@@ -6,16 +6,16 @@ const jpost = async (u, b) => { b = Object.assign({ game: CTXGAME }, b || {}); t
 const POS6 = ["UTG", "MP", "CO", "BTN", "SB", "BB"];
 const BUCKETS = ["deep", "mid", "short", "push"];
 const COMPNAMES = { eval: "Eval S1", seed_poker_eval_s1: "Eval S1", cmqf827h30u7dfca3x2aqvzjv: "Playground S3", cmqggiv9k37am11ydmppz466e: "Tournament S2",
-  cmqma3c2d3sgjnq1qduj0mgv7: "Playground S4 (HU)", cmquozxxm2vmlt6mn6j7gzgdf: "Playground S5", cmr4ou75y1s6vt9h91hqybbsd: "Playground S6",
-  cmqnr6x9q9dclnq1qekuj3jde: "Tournament S3", cmr4otnmu1ru5sc8qlhpt3mgg: "Tournament S5", cmr3n8tft01nilecm1u5jlny7: "HU Ladder S1" };
+  cmqma3c2d3sgjnq1qduj0mgv7: "Playground S4", cmquozxxm2vmlt6mn6j7gzgdf: "Playground S5", cmr4ou75y1s6vt9h91hqybbsd: "Playground S6",
+  cmqnr6x9q9dclnq1qekuj3jde: "Tournament S3", cmr4otnmu1ru5sc8qlhpt3mgg: "Tournament S5",   cmr3n8tft01nilecm1u5jlny7: "Ladder S1" };
 const compName = c => COMPNAMES[c] || c || "";   // id de competición → nombre legible
 
 function app() {
   return {
     zone: "lab", game: "cash", live: false, state: {},
-    agents: [], strategies: [], evalMaxc: 3,
-    evalForm: { agent: "", total: 6, maxc: 2, group: "" }, evalMsg: "", runs: [], groups: [],
-    builder: null, report: null, task: "", taskData: null, taskLog: "",
+    agents: [], strategies: [],
+    evalForm: { agent: "", total: 6, group: "" }, evalMsg: "", runs: [], groups: [],
+    builder: null, report: null, bestAgent: null, task: "", taskData: null, taskLog: "",
     coachForm: { agent: "", window: "" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
     handsScope: "session", coachHands: null, handsCoachText: "", selectedHands: [],
     prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
@@ -184,7 +184,7 @@ function app() {
       if (!this.evalForm.agent) { this.evalMsg = "elige un agente"; return; }
       this.evalMsg = "lanzando…";
       const d = await jpost("/api/lab/eval", this.evalForm);
-      this.evalMsg = d.error ? d.error : `▶ grupo «${d.group}» · ${d.total} agentes (${d.maxc} a la vez)`;
+      this.evalMsg = d.error ? d.error : `▶ grupo «${d.group}» · ${d.total} agentes (1 a la vez)`;
       setTimeout(() => { this.loadRuns(); this.loadGroups(); }, 800);
     },
     async loadRuns() { const d = await jget("/api/runs"); this.runs = d.runs || []; },
@@ -230,6 +230,14 @@ function app() {
         <td>${r.state === "active" ? `<button class="btn sm" data-stoprun="${esc(r.unit)}">parar</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
     },
     async loadReport(name) { this.report = await jget("/api/lab/report?agent=" + encodeURIComponent(name)); },
+    async loadBestAgent() { this.bestAgent = await jget("/api/lab/best-agent"); },
+    async deployBestToPlayground() {
+      if (!confirm("¿Desplegar el mejor agente del Eval en Playground?")) return;
+      this.evalMsg = "lanzando Playground con el mejor agente…";
+      const d = await jpost("/api/lab/deploy-best-pvp", {});
+      this.evalMsg = d.error ? d.error : `▶ Playground lanzado con ${d.agent || "el agente"}`;
+      setTimeout(() => this.loadBestAgent(), 1000);
+    },
     renderReport() {
       const r = this.report; if (!r) return ""; if (r.error) return `<div class="neg">${esc(r.error)}</div>`;
       const agg = r.agg || {};

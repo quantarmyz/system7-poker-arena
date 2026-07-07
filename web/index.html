@@ -49,14 +49,22 @@
           </label>
           <label class="field">etiqueta del grupo <input x-model="evalForm.group" placeholder="(= agente)" maxlength="24" style="width:130px"></label>
           <label class="field">nº agentes <input type="number" min="1" max="50" x-model.number="evalForm.total" style="width:70px"></label>
-          <label class="field">a la vez <input type="number" min="1" :max="evalMaxc" x-model.number="evalForm.maxc" style="width:64px"></label>
         </div>
         <div class="row" style="margin-top:8px">
           <button class="btn suggested" @click="evalAgent()">▶ lanzar evaluación</button>
           <span class="dim" x-text="evalMsg"></span>
         </div>
-        <div class="dim" style="font-size:12px;margin-top:6px">Registra N agentes desechables que juegan 500 manos vs el panel; el report agrega su bb/100 con IC (1 run tiene ±20 de ruido).</div>
+        <div class="dim" style="font-size:12px;margin-top:6px">Registra N agentes desechables que juegan 500 manos vs el panel; el report agrega su bb/100 con IC (1 run tiene ±20 de ruido). Secuencial: 1 a la vez.</div>
         <div style="margin-top:10px" x-html="renderRuns()" @click="onRowClick($event)"></div>
+        <div style="margin-top:12px;padding-top:10px;border-top:1px solid var(--border)">
+          <button class="btn" @click="loadBestAgent()">📊 mejor agente del Eval</button>
+          <button class="btn suggested" @click="deployBestToPlayground()" :disabled="!bestAgent">▶ Playground con mejor agente</button>
+          <div x-show="bestAgent && bestAgent.best" style="margin-top:6px;font-size:12px">
+            <span class="dim">Mejor: </span><b x-text="bestAgent.best?.run_label || '?'"></b>
+            <span class="dim"> → </span><b class="pos" x-text="(bestAgent.best?.bb100 != null ? (bestAgent.best.bb100 >= 0 ? '+' : '') + bestAgent.best.bb100 : '—')"></b>
+            <span class="dim"> bb/100 · </span><span x-text="(bestAgent.best?.hands || 0) + ' manos'"></span>
+          </div>
+        </div>
       </div>
     </div>
 

@@ -72,7 +72,7 @@ def test_pme_per():
 
 
 def test_perejil_thresholds():
-    assert d._perejil_ok(8, 3, 1, False) is True      # flop, 8 outs HU
+    assert d._perejil_ok(8, 3, 1, False) is True      # flop, 8 outs
     assert d._perejil_ok(7, 3, 1, False) is False     # flop needs 8
     assert d._perejil_ok(10, 4, 1, False) is True     # turn needs 10
     assert d._perejil_ok(8, 3, 2, False) is False     # +1 for extra villain

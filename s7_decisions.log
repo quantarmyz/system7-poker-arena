@@ -1,0 +1,12 @@
+[S7] flop pos=SB hand=As/Kd board=Ah/7c/2d tex=dry dyn=static SPR=20.0 str=MF->MF eq=0.89 adjOuts=0 PER=0.00 PME=0.00 villains=1 read=UNKNOWN => bet 3
+[S7] flop pos=SB hand=7s/2d board=Ah/Kc/9d tex=dry dyn=static SPR=20.0 str=AIR->AIR eq=0.18 adjOuts=0 PER=0.00 PME=0.38 villains=1 read=UNKNOWN => fold
+[S7] flop pos=SB hand=Ts/6s board=As/7s/2d tex=semi dyn=static SPR=20.0 str=AIR->AIR eq=0.56 adjOuts=9 PER=0.36 PME=0.17 villains=1 read=UNKNOWN => call
+[S7] flop pos=SB hand=7h/7d board=Ah/7c/2d tex=dry dyn=static SPR=1.7 str=MMF->MMF eq=0.95 adjOuts=0 PER=0.00 PME=0.25 villains=1 read=UNKNOWN => all-in 160
+[S7] flop pos=SB hand=As/Qd board=Ah/7c/2d tex=dry dyn=static SPR=20.0 str=MF->MF eq=0.89 adjOuts=0 PER=0.00 PME=0.00 villains=1 read=STATION => bet 12
+[S7] turn pos=SB hand=5s/2d board=8c/3s/Td/Ac tex=semi dyn=offensive SPR=5.0 str=AIR->AIR eq=0.19 adjOuts=0 PER=0.00 PME=0.23 villains=1 read=NIT => fold
+[S7] flop pos=SB hand=As/Kd board=Ah/7c/2d tex=dry dyn=static SPR=14.3 str=MF->MF eq=0.88 adjOuts=0 PER=0.00 PME=0.50 villains=1 read=NIT => fold
+[S7] flop pos=SB hand=As/Kd board=Ah/7c/2d tex=dry dyn=static SPR=14.3 str=MF->MF eq=0.88 adjOuts=0 PER=0.00 PME=0.50 villains=1 read=MANIAC => call
+[S7] flop pos=SB hand=Ad/5c board=Kh/7c/2d tex=dry dyn=static SPR=20.0 str=MD->MD eq=0.45 adjOuts=0 PER=0.00 PME=0.29 villains=1 read=MANIAC => call
+[S7] river pos=SB hand=Qd/5c board=Kh/8c/3d/2s/7h tex=semi dyn=static SPR=10.0 str=AIR->AIR eq=0.24 adjOuts=0 PER=0.00 PME=0.00 villains=1 read=NIT => bet 6
+[S7] river pos=SB hand=5c/4d board=Kh/8c/3d/2s/7h tex=semi dyn=static SPR=10.0 str=AIR->AIR eq=0.00 adjOuts=0 PER=0.00 PME=0.00 villains=1 read=NIT => check
+[S7] river pos=SB hand=As/9c board=Kh/9d/3s/2c/7h tex=semi dyn=static SPR=10.0 str=MM->MM eq=0.75 adjOuts=0 PER=0.00 PME=0.00 villains=1 read=STATION => bet 24

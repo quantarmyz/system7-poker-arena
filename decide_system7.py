@@ -145,7 +145,7 @@ except Exception:
 # Tipo de juego + modalidad. base=wide → cash agr (retrocompat). S7_GAME/S7_RANGES override por entorno.
 GAME = str(_CFG.get("game") or os.environ.get("S7_GAME") or "cash").lower()
 MODE = str(_CFG.get("mode") or ("agr" if (_CFG.get("base") == "wide" or os.environ.get("S7_RANGES") == "wide") else "std")).lower()
-_HU = bool(_CFG.get("hu"))      # heads-up (1v1): postflop consciente de posición (botón=SB=IP)
+
 _bbk = _CFG.get("bb_buckets")
 BB_BUCKETS = _bbk if (isinstance(_bbk, list) and len(_bbk) == 3) else [40, 20, 10]
 _CASH_SETS = {"agr": OPENING_RANGES_AGR, "nit": OPENING_RANGES_NIT, "std": OPENING_RANGES_STD}
@@ -235,7 +235,7 @@ def _hand_class(hole) -> str:
 def _equity(hole, board, n_villains=1, sims=160, deadline_s=10.0) -> float:
     """Monte-Carlo showdown equity vs N random villains (treys): hero wins the
     pot only if it beats EVERY opponent. Multiway-aware — crucial, since a hand
-    that is +EV heads-up is often crushed against 5 ranges."""
+    that is +EV in isolation is often crushed against multiple ranges."""
     nv = max(1, min(int(n_villains), 5))
     cls = _hand_class(hole)
     if not _HAS_TREYS or deadline_s < 2.5 or not board:
@@ -656,7 +656,7 @@ def decide(table: dict, deadline_s: float = 10.0,
     texture = _texture(board)
     n_live = sum(1 for s in seats if str(s.get("status") or "").lower() not in ("folded", "out", "sittingout"))
     n_villains = max(1, n_live - 1)
-    hu_now = _HU or (GAME == "tournament" and n_live == 2)   # HU dinámico: en torneo, mesa final de 2 → postflop consciente de posición (IP=botón)
+    hu_now = False  # removed: position-aware postflop was HU-specific
     reads = _villain_reads(table, research_context)
     arc = reads.get("archetype", "UNKNOWN")
     _wtsd = _pct(reads.get("wtsd"))
@@ -816,25 +816,24 @@ def decide(table: dict, deadline_s: float = 10.0,
         if strength_eff in ("MMF", "MF") or (eq > KN["value_eq"] and not station):
             decision = value_bet()
         elif strength_eff == "MM":
-            if ((hu_now and pos == "SB" and not (maniac or bluffy)) or (street == "river" and station)) and ("bet" in avail or "raise" in avail):   # HU IP bet fino MM; o value fino en river vs station
+            if ((street == "river" and station)) and ("bet" in avail or "raise" in avail):   # value fino en river vs station
                 decision = value_bet()
             else:
                 decision = _act("check", None, allowed, f"pot control {strength}", FALLBACK_REASONING) \
                     if "check" in avail else value_bet()
         else:
-            # AIR / draw: Perejil bluff vs weakness; cbet-bluff on overfolder; en HU el botón (IP) c-betea de rango.
+            # AIR / draw: Perejil bluff vs weakness; cbet-bluff on overfolder.
             weak_spot = dyn == "static" and not station
-            hu_ip_cbet = hu_now and pos == "SB" and texture != "extreme"         # range-cbet IP HU: dry/semi/coord (no en las MUY húmedas) → sube la freq de c-bet
             river_ok = board_len < 5 or _river_blocker(hole, board)              # en river, solo farol con bloqueador (selección de farol; sin él → give-up)
             if not station and river_ok and (_perejil_ok(adj_outs, board_len, n_villains, overfolder) or
-                                (overfolder and texture in ("dry", "semi")) or hu_ip_cbet):
+                                (overfolder and texture in ("dry", "semi"))):
                 br = allowed.get("betRange") or {}
-                frac = KN["cbet_bluff_frac"] if (overfolder or hu_ip_cbet) else SIZING[texture][street]
+                frac = KN["cbet_bluff_frac"] if overfolder else SIZING[texture][street]
                 amt = _clamp(int(pot * frac) or bb, br, bb, pot * 2)
                 act = "bet" if "bet" in avail else None
                 if act:
                     decision = _act(act, amt, allowed,
-                                    f"{'cbet IP-HU' if hu_ip_cbet else 'perejil bluff'} {adj_outs}o ({arc})",
+                                    f"perejil bluff {adj_outs}o ({arc})",
                                     _reasoning(act, 0, 0, "AIR", texture, adj_outs))
             if decision is None:
                 decision = _act("check", None, allowed, f"check {strength}", FALLBACK_REASONING) \

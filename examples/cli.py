@@ -52,7 +52,7 @@ commands:
   version     print version + git commit
 
 examples:
-  pokerkit selfplay                        # 200 HU hands vs tight bot, ~1s
+  pokerkit selfplay                        # 200 hands vs tight bot, ~1s
   pokerkit selfplay --hands 1000 --opponent random
   pokerkit selfplay --players 6 --opponent mixed --seed 42
   pokerkit run --max-hands 50              # 50-hand Arena preview (~3-5 min)

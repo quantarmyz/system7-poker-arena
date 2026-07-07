@@ -15,7 +15,7 @@ Arena uses. Use selfplay to catch bugs and validate gross direction
 `pokerkit run --max-hands 50` to confirm gains hold against DeepCFR.
 
 Usage:
-    pokerkit selfplay                              # 200 hands HU vs tight-passive
+    pokerkit selfplay                              # 200 hands vs tight-passive
     pokerkit selfplay --hands 1000 --opponent random
     pokerkit selfplay --agent examples/agent.py    # explicit decide() source
     pokerkit selfplay --players 6                  # 6-max vs mixed bots
@@ -400,7 +400,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--hands", type=int, default=200,
                         help="Number of hands to play (default 200)")
     parser.add_argument("--players", type=int, default=2,
-                        help="Total players including hero, 2-6 (default 2 = HU)")
+                        help="Total players including hero, 2-6 (default 2)")
     parser.add_argument("--opponent", default="tight",
                         choices=["tight", "loose", "random", "call", "mixed"],
                         help="Opponent profile (default tight)")

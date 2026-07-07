@@ -64,6 +64,12 @@ llm = [
     { name = "openai" },
 ]
 
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "respx" },
+]
+
 [package.metadata]
 requires-dist = [
     { name = "anthropic", marker = "extra == 'llm'", specifier = ">=0.40" },
@@ -76,6 +82,12 @@ requires-dist = [
     { name = "treys", specifier = ">=0.1.8" },
 ]
 provides-extras = ["llm", "dev"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=9.1.0" },
+    { name = "respx", specifier = ">=0.23.1" },
+]
 
 [[package]]
 name = "certifi"

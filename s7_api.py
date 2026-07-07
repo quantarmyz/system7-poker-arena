@@ -27,8 +27,7 @@ try:
 except Exception:
     s7_strat = None
 
-# Tope de concurrencia del Eval (evita los 429 que vimos al correr 7 a la vez).
-EVAL_MAXC = int(os.environ.get("S7_EVAL_MAXC", "3"))
+# Eval runs sequentially (1 at a time), no concurrency.
 
 
 def set_game(g):
@@ -137,10 +136,6 @@ def lab_eval(body):
         total = max(1, min(50, int(body.get("total", 6))))
     except Exception:
         total = 6
-    try:
-        maxc = max(1, min(EVAL_MAXC, int(body.get("maxc", 2))))
-    except Exception:
-        maxc = 2
     group = str(body.get("group", "") or name).strip().lower()
     if not re.fullmatch(r"[a-z0-9_-]{1,24}", group):
         return {"error": "etiqueta inválida (a-z 0-9 _ - , máx 24)"}
@@ -149,15 +144,15 @@ def lab_eval(body):
     env = {"S7_STATS_DB": _dbpath(p.get("game", "cash"))}     # escribe en la DB del game del perfil
     env.update(s7_agents.env_for(p))          # S7_STRAT/S7_MODEL/S7_HUD/S7_TRACKER (heredado por los hijos)
     env["S7_POLL_INTERVAL"] = "0.5"           # Eval más rápido (sondeo más frecuente; se autoback-offea en 429)
-    argv = s7_jobs.pyrun("s7_batch.py", total, maxc, strat, engine, group)   # tag = etiqueta del grupo
+    argv = s7_jobs.pyrun("s7_batch.py", total, strat, engine, group)   # tag = etiqueta del grupo
     try:
         unit = s7_jobs.launch("lab-" + group, argv, env)
     except Exception as e:
         return {"error": str(e)[:300]}
     g = _jload(_GROUPS_PATH, {})
-    g[group] = {"agent": name, "game": p.get("game", "cash"), "total": total, "maxc": maxc, "ts": time.time()}
+    g[group] = {"agent": name, "game": p.get("game", "cash"), "total": total, "ts": time.time()}
     _jwrite(_GROUPS_PATH, g)
-    return {"ok": True, "unit": unit, "agent": name, "group": group, "total": total, "maxc": maxc}
+    return {"ok": True, "unit": unit, "agent": name, "group": group, "total": total}
 
 
 def lab_report(agent):
@@ -303,16 +298,17 @@ def _is_continuous(competition):
     return str(competition or "") not in ("eval", "seed_poker_eval_s1", "")
 
 
-def _prod_launch(agent, competition):
+def _prod_launch(agent, competition, game=None, force_pvp=False):
     p = s7_agents.load(agent)
     if not p:
         return {"error": "perfil no encontrado"}
     import secrets as _sec
-    game = p.get("game", "cash")
+    if game is None:
+        game = p.get("game", "cash")
     env = {"S7_STATS_DB": _dbpath(game), "S7_PVP_LOCK": "/data/.pvp-%s.lock" % game}   # lock por game → Playground (cash) y Tournament (torneo) conviven
     env.update(s7_agents.env_for(p))
     label = "prod-" + _sec.token_hex(4)
-    if competition in ("eval", "seed_poker_eval_s1", ""):
+    if force_pvp or (competition and competition not in ("eval", "seed_poker_eval_s1", "")):
         env["S7_SAVE_CREDS"] = "1"; env["S7_RUN_LABEL"] = label; env["S7_AGENT_NAME"] = agent
         env["S7_POLL_INTERVAL"] = "0.5"        # Eval más rápido
         env["S7_MATCH_TIMEOUT"] = "9000"       # 150 min: deja completar las 500 manos en híbrido (M3 es lento)
@@ -1012,3 +1008,60 @@ def lab_groups():
                     "active": active, "hands": hands})
     out.sort(key=lambda x: -(x["ts"] or 0))
     return {"groups": out}
+
+
+def lab_best_agent():
+    """Returns the agent with the best adjusted bb/100 from Eval runs (hands >= 400).
+    Used to auto-deploy the best performer to Playground."""
+    try:
+        c = _ro()
+    except Exception as e:
+        return {"error": str(e)}
+    runs = c.execute(
+        "select run_label, adjusted_bb100, hands, raw_bb100, raw_chip_delta, ts "
+        "from runs where adjusted_bb100 is not null and hands >= 400 "
+        "order by adjusted_bb100 desc").fetchall()
+    c.close()
+    best = None
+    agent_name = None
+    for rl, bb, h, raw_bb, raw_cd, ts in runs:
+        # Extract the agent name from the run_label (format: clasif-<agent><num>-<rand> or similar)
+        # Try to match against known agent profiles
+        parts = rl.replace("clasif-", "").replace("lab-", "")
+        # Try to find a matching agent: clasif-<name><digits>-<digits>
+        m = re.match(r"([a-z0-9_-]+)\d+-\d+", parts)
+        if m:
+            candidate = m.group(1).lower()
+        else:
+            candidate = parts.lower()
+        # Verify this is a real agent
+        p = s7_agents.load(candidate)
+        if p:
+            best = {"run_label": rl, "bb100": bb, "hands": h, "raw_bb100": raw_bb,
+                    "raw_chip_delta": raw_cd, "ts": ts, "agent": candidate}
+            agent_name = candidate
+            break
+    if not best:
+        # Fallback: just return the best run_label without agent matching
+        if runs:
+            rl, bb, h, raw_bb, raw_cd, ts = runs[0]
+            return {"best": {"run_label": rl, "bb100": bb, "hands": h,
+                             "raw_bb100": raw_bb, "raw_chip_delta": raw_cd, "ts": ts},
+                    "agent": None}
+    return {"best": best, "agent": agent_name}
+
+
+def lab_deploy_best_pvp():
+    """Takes the best agent from Eval and deploys it to Playground.
+    Returns the deploy result."""
+    result = lab_best_agent()
+    if result.get("error"):
+        return result
+    agent = result.get("agent")
+    if not agent:
+        return {"error": "no agent found to deploy"}
+    p = s7_agents.load(agent)
+    if not p:
+        return {"error": "agent profile not found"}
+    game = p.get("game", "cash")
+    return _prod_launch(agent, None, game=game, force_pvp=True)
