@@ -1,62 +1,67 @@
-/* System 7 — app Alpine: estado + carga de datos + render de las 3 zonas. Reusa viz.js. */
+/* System 7 — app Alpine: estado + carga de datos + render de las 4 zonas (LAB · COACH · JUEGO · MODELOS). Reusa viz.js. */
 let CTXGAME = "cash";          // contexto de datos: cash | tournament (bifurcación de BD)
 const _g = u => u + (u.includes("?") ? "&" : "?") + "game=" + CTXGAME;
 const jget = async u => { try { return await (await fetch(_g(u))).json(); } catch (e) { return { error: String(e) }; } };
 const jpost = async (u, b) => { b = Object.assign({ game: CTXGAME }, b || {}); try { return await (await fetch(u, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) })).json(); } catch (e) { return { error: String(e) }; } };
 const POS6 = ["UTG", "MP", "CO", "BTN", "SB", "BB"];
 const BUCKETS = ["deep", "mid", "short", "push"];
-const COMPNAMES = { eval: "Eval S1", seed_poker_eval_s1: "Eval S1", cmqf827h30u7dfca3x2aqvzjv: "Playground S3", cmqggiv9k37am11ydmppz466e: "Tournament S2",
-  cmqma3c2d3sgjnq1qduj0mgv7: "Playground S4 (HU)", cmquozxxm2vmlt6mn6j7gzgdf: "Playground S5", cmr4ou75y1s6vt9h91hqybbsd: "Playground S6",
-  cmqnr6x9q9dclnq1qekuj3jde: "Tournament S3", cmr4otnmu1ru5sc8qlhpt3mgg: "Tournament S5", cmr3n8tft01nilecm1u5jlny7: "HU Ladder S1" };
-const compName = c => COMPNAMES[c] || c || "";   // id de competición → nombre legible
+const COMPNAMES = { eval: "Eval S1", seed_poker_eval_s1: "Eval S1" };   // fallback mínimo; las seasons vivas llegan por /api/seasons
+let SEASONS = {};                                                       // id de competición → nombre (dinámico, rollover-safe)
+const compName = c => SEASONS[c] || COMPNAMES[c] || c || "";
 
 function app() {
   return {
     zone: "lab", game: "cash", live: false, state: {},
-    agents: [], strategies: [], evalMaxc: 3,
+    agents: [],
     evalForm: { agent: "", total: 6, maxc: 2, group: "" }, evalMsg: "", runs: [], groups: [],
     builder: null, report: null, task: "", taskData: null, taskLog: "",
-    coachForm: { agent: "", window: "" }, coachData: null, coachText: "", sgMode: "leaks", sgMsg: "",
+    coachForm: { window: "" }, coachData: null, coachText: "", sgMode: "leaks",
     handsScope: "session", coachHands: null, handsCoachText: "", selectedHands: [],
-    prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "", account: null, deployForm: { agent: "", competition: "" }, hands: [], handFilter: "", llmOnly: false, opponents: [],
-    modalHand: null, modalOpp: null, step: 0, embed: true, eqOpt: { ev: true, off: {} },
-    settings: {}, keyInput: {}, baseInput: {}, liveModel: "", defModel: "", settingsMsg: "", settingsMsg2: "",
-    settingsProviders: [{ id: "minimax", label: "MiniMax" }, { id: "xiaomi", label: "Xiaomi MiMo", needBase: true }, { id: "openrouter", label: "OpenRouter" }, { id: "deepseek", label: "DeepSeek" }],
+    prod: {}, prodComps: [], rank: [], prodSel: "", prodSelName: "", prodSession: null, prodLog: "",
+    account: null, seasons: [], deployForm: { agent: "", competition: "" },
+    hands: [], handFilter: "", llmOnly: false, opponents: [],
+    pending: [], history: [], evolveDetail: null, evolveRejectVisible: false, evolveRejectReason: "",
+    evolve: { interval: 1000 },
+    modalHand: null, modalOpp: null, modalHelp: false, step: 0, embed: true, eqOpt: { ev: true, off: {} },
+    settings: {}, keyInput: {}, baseInput: {}, liveModel: "", defModel: "", liveCustom: "", defCustom: "",
+    settingsMsg: "", settingsMsg2: "",
+    settingsProviders: [{ id: "openrouter", label: "OpenRouter" }, { id: "deepseek", label: "DeepSeek" },
+      { id: "minimax", label: "MiniMax" }, { id: "xiaomi", label: "Xiaomi MiMo", needBase: true }],
 
     init() {
-      CTXGAME = this.game; this.tick(); this.loadAgents(); this.loadRuns();
+      CTXGAME = this.game; this.tick(); this.loadAgents(); this.loadRuns(); this.loadSeasons();
       setInterval(() => this.tick(), 4000);
       setInterval(() => { if (this.zone === "lab") { this.loadRuns(); this.loadGroups(); if (this.task) this.loadTask(); } }, 15000);
-      setInterval(() => { if (this.zone === "production" && ((this.prod || {}).active || []).length) { this.loadHands(); this.loadProdLog(); } }, 2000);   // manos + log casi en vivo
-      setInterval(() => { if (this.zone === "production") { this.loadAccount(); this.loadProd(); this.loadRank(); this.loadSession(); } }, 30000);   // posición del leaderboard + stats al día (sigue el ranking en vivo; suave con el rate-limit)
+      setInterval(() => { if (this.zone === "juego" && ((this.prod || {}).active || []).length) { this.loadHands(); this.loadProdLog(); } }, 2000);   // manos + log casi en vivo
+      setInterval(() => { if (this.zone === "juego") { this.loadAccount(); this.loadRank(); this.loadSession(); this.loadSeasons(); } }, 30000);   // leaderboard + stats al día (suave con el rate-limit)
+      setInterval(() => { if (this.zone === "coach") { this.loadEvolvePending(); this.loadEvolveStatus(); } }, 10000);   // propuestas cada 10s
     },
     setGameCtx(g) { this.game = g; CTXGAME = g; this.builder = null; this.report = null; this.setZone(this.zone); },
 
     async tick() {
       const d = await jget("/api/state");
       this.live = !d.error; if (!d.error) this.state = d;
-      // con deploy activo, manos ya las refresca el interval de 2s; sesión/ranking van en el de 30s + clicks
-      if (this.zone === "production") { this.loadProd(); if (!((this.prod || {}).active || []).length) this.loadHands(); }
+      if (this.zone === "juego") { this.loadProd(); if (!((this.prod || {}).active || []).length) this.loadHands(); }
     },
     setZone(z) {
       this.zone = z;
       if (z === "lab") { this.loadAgents(); this.loadRuns(); this.loadGroups(); }
-      if (z === "coach") { this.loadAgents(); this.loadCoach(); this.loadCoachHands(); }
-      if (z === "production") { this.loadProd(); this.loadCompetitions(); this.loadRank(); this.loadHands(); this.loadOpponents(); this.loadSession(); this.loadAccount(); }
-      if (z === "settings") { this.loadSettings(); }
+      if (z === "coach") { this.loadCoach(); this.loadCoachHands(); this.loadEvolvePending(); this.loadEvolveHistory(); this.loadEvolveStatus(); }
+      if (z === "juego") { this.loadAgents(); this.loadProd(); this.loadCompetitions(); this.loadRank(); this.loadHands(); this.loadOpponents(); this.loadSession(); this.loadAccount(); this.loadSeasons(); }
+      if (z === "modelos") { this.loadSettings(); }
     },
 
     renderKpis() {
       const d = this.state || {};
-      const k = [["manos", d.hands ?? "—"], ["decisiones", d.decisions ?? "—"], ["M3 %", (d.m3pct ?? 0) + "%"]];
+      const k = [["manos", d.hands ?? "—"], ["decisiones", d.decisions ?? "—"], ["LLM %", (d.m3pct ?? 0) + "%"]];
       return k.map(x => `<div class="kpi"><div class="l">${x[0]}</div><div class="v">${x[1]}</div></div>`).join("");
     },
 
     /* ───── LAB: agentes ───── */
-    async loadAgents() { const d = await jget("/api/agents"); this.agents = d.agents || []; this.strategies = d.strategies || [];
+    async loadAgents() { const d = await jget("/api/agents"); this.agents = d.agents || [];
       if (this.agents.length) { if (!this.deployForm.agent) this.deployForm.agent = this.agents[0].name; if (!this.evalForm.agent) this.evalForm.agent = this.agents[0].name; } },
     renderAgents() {
-      if (!this.agents.length) return '<div class="empty">Aún no hay agentes. Crea uno con «+ nuevo».</div>';
+      if (!this.agents.length) return '<div class="empty">Aún no hay agentes. Crea uno con «+ cash» / «+ torneo».</div>';
       const rows = this.agents.map(a => {
         const bb = a.mean == null ? '<span class="dim">sin eval</span>' : `<b class="${a.mean >= 0 ? "pos" : "neg"}">${a.mean >= 0 ? "+" : ""}${a.mean}</b>${a.ci != null ? ` <span class="dim">±${a.ci}</span>` : ""}`;
         return `<tr><td><b>${esc(a.title || a.name)}</b>${a.title ? ` <span class="dim" style="font-size:11px">${esc(a.name)}</span>` : ""}${a.note ? `<div class="dim" style="font-size:11px;white-space:normal;max-width:300px">${esc(a.note)}</div>` : ""}</td><td>${esc(a.strategy || "std")}</td><td>${esc(a.engine)}</td>
@@ -71,7 +76,10 @@ function app() {
     onAgentsClick(e) {
       const b = e.target.closest("[data-edit],[data-eval],[data-report],[data-del]"); if (!b) return;
       if (b.dataset.edit != null) this.editAgent(b.dataset.edit);
-      else if (b.dataset.eval != null) { this.evalForm.agent = b.dataset.eval; this.evalAgent(); }
+      else if (b.dataset.eval != null) {
+        if (!confirm(`¿Lanzar una evaluación de «${b.dataset.eval}»? (${this.evalForm.total} agentes × 500 manos)`)) return;
+        this.evalForm.agent = b.dataset.eval; this.evalAgent();
+      }
       else if (b.dataset.report != null) this.loadReport(b.dataset.report);
       else if (b.dataset.del != null && confirm("¿Borrar el perfil " + b.dataset.del + "?")) this.deleteAgent(b.dataset.del);
     },
@@ -94,7 +102,7 @@ function app() {
         ranges, tourn, sizing: JSON.parse(JSON.stringify(t.sizing || {})),
         knobs: Object.assign({}, t.knobs || {}), limits: t.knob_limits || {},
         tbv: (t.threebet_value || []).join(" "), tbb: (t.threebet_bluff || []).join(" "),
-        engine: profile.engine || "hybrid", model: profile.model || "", provider: profile.provider || "minimax",
+        engine: profile.engine || "hybrid", model: profile.model || "", provider: profile.provider || "openrouter",
         hud: profile.hud !== false, tracker: profile.tracker !== false, prose: t.prose || "",
         title: profile.title || "", note: profile.note || "",
       };
@@ -111,8 +119,12 @@ function app() {
           <label class="field">juego <select id="b-game"><option value="cash" ${b.game === "cash" ? "selected" : ""}>cash</option><option value="tournament" ${b.game === "tournament" ? "selected" : ""}>torneo</option></select></label>`;
       if (b.game === "cash") head += `<label class="field">modalidad <select id="b-mode"><option value="agr" ${b.mode === "agr" ? "selected" : ""}>AGR</option><option value="std" ${b.mode === "std" ? "selected" : ""}>STD</option><option value="nit" ${b.mode === "nit" ? "selected" : ""}>NIT</option></select></label>`;
       head += `<label class="field">motor <select id="b-engine"><option ${b.engine === "hybrid" ? "selected" : ""}>hybrid</option><option ${b.engine === "heur" ? "selected" : ""}>heur</option></select></label>
-          <label class="field">modelo LLM <input id="b-model" value="${esc(b.model)}" placeholder="MiniMax-M3" style="width:140px"></label>
-          <label class="field">proveedor <select id="b-provider"><option ${b.provider === "minimax" ? "selected" : ""}>minimax</option><option ${b.provider === "openrouter" ? "selected" : ""}>openrouter</option><option ${b.provider === "xiaomi" ? "selected" : ""}>xiaomi</option></select></label>
+          <label class="field">modelo LLM <input id="b-model" value="${esc(b.model)}" placeholder="deepseek/deepseek-v3.2" style="width:170px"></label>
+          <label class="field">proveedor <select id="b-provider">
+            <option ${b.provider === "openrouter" ? "selected" : ""}>openrouter</option>
+            <option ${b.provider === "minimax" ? "selected" : ""}>minimax</option>
+            <option ${b.provider === "deepseek" ? "selected" : ""}>deepseek</option>
+            <option ${b.provider === "xiaomi" ? "selected" : ""}>xiaomi</option></select></label>
           <label class="toggle"><input type="checkbox" id="b-hud" ${b.hud ? "checked" : ""}> HUD</label>
           <label class="toggle"><input type="checkbox" id="b-tracker" ${b.tracker ? "checked" : ""}> tracker</label></div>
         <div class="row" style="margin-top:8px"><label class="field" style="flex:1 1 100%">descripción <textarea id="b-note" rows="2" maxlength="400" placeholder="¿para qué es este agente? estilo, notas, recordatorios…" style="width:100%;resize:vertical">${esc(b.note)}</textarea></label></div>`;
@@ -204,13 +216,13 @@ function app() {
       const r = e.target.closest("[data-key]"); if (r) this.openHand(decodeURIComponent(r.dataset.key));
     },
     renderTaskMonitor() {
-      if (!this.task) return '<div class="empty">elige una tarea (agente) arriba para ver su evaluación en vivo</div>';
+      if (!this.task) return '<div class="empty">elige una tarea (grupo) arriba para ver su evaluación en vivo</div>';
       const d = this.taskData; if (!d) return '<div class="empty">cargando…</div>'; if (d.error) return `<div class="neg">${esc(d.error)}</div>`;
       const kpi = (l, v) => `<div class="kpi" style="text-align:left"><div class="l">${l}</div><div class="v" style="font-size:18px">${v}</div></div>`;
       const head = `<div class="row" style="gap:18px;align-items:center">
         ${kpi("estado", d.active ? '<span class="pos">▶ ' + d.active + ' activo</span>' : '<span class="dim">parado</span>')}
         ${kpi("manos", (d.hands || 0).toLocaleString())}${kpi("decisiones", (d.decisions || 0).toLocaleString())}
-        ${kpi("M3 %", (d.m3pct || 0) + "%")}${kpi("bb/100 ± IC", d.agg.mean == null ? "—" : (d.agg.mean >= 0 ? "+" : "") + d.agg.mean + (d.agg.ci != null ? " ±" + d.agg.ci : ""))}
+        ${kpi("LLM %", (d.m3pct || 0) + "%")}${kpi("bb/100 ± IC", d.agg.mean == null ? "—" : (d.agg.mean >= 0 ? "+" : "") + d.agg.mean + (d.agg.ci != null ? " ±" + d.agg.ci : ""))}
         <span class="spacer"></span>${d.active ? `<button class="btn destructive" data-stoptask="${esc(d.agent)}">⏹ parar evaluación</button>` : ""}</div>`;
       const dist = `<div class="dim" style="margin-top:8px">distribución de bb/100 por agente (campana de Gauss)</div>${gaussChart(d.samples, "bb/100")}`;
       const pos = `<div class="dim" style="margin-top:8px">VPIP / PFR por posición</div><div>${(d.bypos || []).map(p => `<span style="margin-right:12px">${p.pos} <b>${p.vpip}%</b>/<b>${p.pfr}%</b> <span class="dim">n${p.n}</span></span>`).join("") || '<span class="dim">—</span>'}</div>`;
@@ -224,7 +236,7 @@ function app() {
       return head + `<div class="grid" style="margin-top:6px"><div class="col-6">${dist}${pos}</div><div class="col-6">${heat}</div></div>` + log + handsT;
     },
     renderRuns() {
-      if (!this.runs.length) return '<div class="dim">sin entrenamientos activos</div>';
+      if (!this.runs.length) return '<div class="dim">sin evaluaciones activas</div>';
       return `<table class="list"><tbody>${this.runs.slice(0, 12).map(r => `<tr><td><span class="dot ${r.state === "active" ? "up" : "down"}"></span> ${esc(r.label)}</td>
         <td class="num">${r.matches || 0}</td><td class="num">${r.bb100 == null ? "—" : (r.bb100 >= 0 ? "+" : "") + r.bb100}</td>
         <td>${r.state === "active" ? `<button class="btn sm" data-stoprun="${esc(r.unit)}">parar</button>` : ""}</td></tr>`).join("")}</tbody></table>`;
@@ -293,25 +305,50 @@ function app() {
       poll();
     },
     coachLLM() {
-      const w = this.coachForm.window; let n = 0; this.coachText = "⏳ pidiendo análisis a M3…";
+      const w = this.coachForm.window; let n = 0; this.coachText = "⏳ pidiendo análisis al LLM…";
       const poll = async () => { const d = await jget("/api/coach/llm?window=" + w);
         if (d.locked) { this.coachText = `bloqueado: ${d.hands}/${d.need} manos`; return; }
         if (d.error) { this.coachText = `<span class="neg">${esc(d.error)}</span>`; return; }
-        if (d.running) { n++; this.coachText = `⏳ M3 analizando… (${n * 4}s)`; if (n < 75) setTimeout(poll, 4000); return; }
+        if (d.running) { n++; this.coachText = `⏳ LLM analizando… (${n * 4}s)`; if (n < 75) setTimeout(poll, 4000); return; }
         this.coachText = esc(d.text || "") + (d.version ? `<div style="margin-top:8px"><span class="pill accent">propuesta ${esc(d.version)}</span></div>` : ""); };
       poll();
     },
     genStrategy() {
-      const w = this.coachForm.window, mode = this.sgMode; let n = 0; this.sgMsg = "⏳ pidiendo estrategia a M3…";
+      const w = this.coachForm.window, mode = this.sgMode; let n = 0; this.coachText = "⏳ pidiendo estrategia al LLM…";
       const poll = async () => { const d = await jget("/api/coach/strategy?window=" + w + "&mode=" + mode);
-        if (d.locked) { this.sgMsg = `bloqueado: ${d.hands}/${d.need} manos (usa «ideal desde cero»)`; return; }
-        if (d.error) { this.sgMsg = `error: ${d.error}`; return; }
-        if (d.running) { n++; this.sgMsg = `⏳ diseñando… (${n * 4}s)`; if (n < 75) setTimeout(poll, 4000); return; }
-        this.sgMsg = "✓ propuesta lista — revísala en el LAB"; this.mountBuilder(d, {}); };
+        if (d.locked) { this.coachText = `bloqueado: ${d.hands}/${d.need} manos (usa «ideal desde cero»)`; return; }
+        if (d.error) { this.coachText = `error: ${d.error}`; return; }
+        if (d.running) { n++; this.coachText = `⏳ diseñando… (${n * 4}s)`; if (n < 75) setTimeout(poll, 4000); return; }
+        this.coachText = "✓ propuesta lista — revísala en el builder del LAB"; this.mountBuilder(d, {}); };
       poll();
     },
 
-    /* ───── PRODUCCIÓN ───── */
+    /* ───── EVOLVE (dentro de COACH) ───── */
+    async loadEvolvePending() { const d = await jget("/api/evolve/pending"); this.pending = d.pending || []; },
+    async loadEvolveHistory() { const d = await jget("/api/evolve/history"); this.history = d.history || []; },
+    async loadEvolveStatus() { const d = await jget("/api/evolve/status"); if (d.interval) this.evolve.interval = d.interval; },
+    async openEvolveDetail(id) {
+      const d = await jget("/api/evolve/proposal?id=" + encodeURIComponent(id));
+      if (d.proposal) { this.evolveDetail = d.proposal; this.evolveRejectVisible = false; this.evolveRejectReason = ""; }
+    },
+    async approveEvolve(id) {
+      if (!confirm("¿Aprobar esta propuesta? Esto NO despliega la estrategia — solo la marca como aprobada.")) return;
+      const r = await jpost("/api/evolve/approve", { id, by: "user" });
+      if (r.ok) { this.evolveDetail = null; await this.loadEvolvePending(); await this.loadEvolveHistory(); }
+      else alert("Error: " + (r.error || "desconocido"));
+    },
+    async rejectEvolve(id) {
+      if (!confirm("¿Rechazar esta propuesta?")) return;
+      const r = await jpost("/api/evolve/reject", { id, by: "user", reason: this.evolveRejectReason });
+      if (r.ok) { this.evolveDetail = null; this.evolveRejectVisible = false; this.evolveRejectReason = ""; await this.loadEvolvePending(); await this.loadEvolveHistory(); }
+      else alert("Error: " + (r.error || "desconocido"));
+    },
+    async saveEvolveInterval() {
+      const r = await jpost("/api/settings/interval", { interval: this.evolve.interval });
+      if (r && r.error) alert("No se pudo guardar: " + r.error);
+    },
+
+    /* ───── JUEGO ───── */
     async loadProd() { this.prod = await jget("/api/production/status"); this.loadProdLog(); },
     async loadProdLog() {
       const a = ((this.prod || {}).active || [])[0];
@@ -321,49 +358,62 @@ function app() {
     },
     async loadCompetitions() { const d = await jget("/api/production/competitions"); this.prodComps = d.competitions || []; if (this.prodComps.length && !this.prodComps.find(c => c.id === this.deployForm.competition)) this.deployForm.competition = this.prodComps[0].id; },
     async loadRank() { const d = await jget("/api/rank"); this.rank = d.agents || []; },
-    async loadAccount() { this.account = null; this.account = await jget("/api/production/account"); },
+    async loadAccount() { this.account = await jget("/api/production/account"); },
+    async loadSeasons() {
+      const d = await jget("/api/seasons");
+      this.seasons = d.seasons || [];
+      SEASONS = {}; this.seasons.forEach(s => { if (s.id) SEASONS[s.id] = s.name; });
+    },
+    async reresolveSeason() {
+      const r = await jpost("/api/seasons/reresolve", {});
+      if (r && r.error) { alert("No se pudo: " + r.error); return; }
+      await this.loadSeasons(); await this.loadCompetitions(); await this.loadAccount();
+    },
     renderAccount() {
       const a = this.account;
-      if (!a) return '<div class="empty">cargando… (busca tu posición en cada leaderboard)</div>';
-      if (a.error) return `<div class="neg">${esc(a.error)}</div>`;
-      const ag = a.agent || {};
-      const head = `<div class="row" style="gap:12px;align-items:center"><b style="font-size:15px">${esc(ag.handle || ag.name || ag.agentId || "?")}</b>
-        ${ag.claimed ? `<span class="pill green">reclamado${ag.owner ? " · @" + esc(ag.owner) : ""}</span>` : '<span class="pill amber">sin reclamar</span>'}
-        <span class="dim" style="font-size:11px">${esc(ag.agentId || "")}</span></div>`;
-      const evs = (a.events || []).map(e => `<tr><td><b>${esc(e.name)}</b></td>
-        <td class="num">${e.rank != null ? `<b class="pos">#${e.rank}</b> <span class="dim">/ ${e.total || "?"}</span>` : '<span class="dim">no registrado / sin posición</span>'}</td>
-        <td class="num">${e.score != null ? e.score : "—"}</td></tr>`).join("");
-      return head + `<table class="list" style="margin-top:8px"><thead><tr><th>evento</th><th class="num">posición</th><th class="num">score</th></tr></thead><tbody>${evs}</tbody></table>`;
+      let head = '<div class="dim">cargando cuenta…</div>';
+      if (a && a.error) head = `<div class="neg">${esc(a.error)}</div>`;
+      else if (a) {
+        const ag = a.agent || {};
+        head = `<div class="row" style="gap:8px;align-items:center"><b>${esc(ag.handle || ag.name || ag.agentId || "?")}</b>
+          ${ag.claimed ? `<span class="pill green">reclamado${ag.owner ? " · @" + esc(ag.owner) : ""}</span>` : '<span class="pill amber">sin reclamar</span>'}</div>` +
+          (a.events || []).map(e => `<div class="row" style="justify-content:space-between;border-bottom:1px solid var(--border);padding:3px 0">
+            <span class="dim" style="font-size:12px">${esc(e.name)}</span>
+            <span style="font-size:12px">${e.rank != null ? `<b class="pos">#${e.rank}</b> <span class="dim">/ ${e.total || "?"}</span>` : '<span class="dim">—</span>'}</span></div>`).join("");
+      }
+      const ss = this.seasons.length
+        ? `<div class="dim" style="margin:10px 0 4px">temporadas activas</div>` + this.seasons.map(s =>
+          `<div class="row" style="justify-content:space-between;padding:3px 0;border-bottom:1px solid var(--border)">
+            <span style="font-size:12px">${s.playing ? "🟢" : "⚪"} <b>${esc(s.name)}</b></span>
+            <span style="font-size:12px">${s.registered ? '<span class="pill green">registrado</span>' : '<span class="dim">no registrado</span>'}</span></div>`).join("")
+        : "";
+      return head + ss;
     },
     async loadSession() { this.prodSession = await jget("/api/production/session?label=" + encodeURIComponent(this.prodSel || "")); },   // sin selección = unificado (temporada actual); el 👁 del Ranking fija prodSel
     renderProdControl() {
-      const p = this.prod || {};
-      const act = (p.active || []).map(a => `<div class="row" style="margin:4px 0"><span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>${a.continuous ? ` <span class="pill amber">continuo · la cola espera</span>` : ""}
-        <button class="btn sm destructive" data-stopprod="${esc(a.unit)}">parar</button>
-        <button class="btn sm" data-claim="${esc(a.label)}">🏆 reclamar</button></div>`).join("") || `<div class="dim">nada jugando ahora</div>`;
+      const p = this.prod || {}, br = p.bankroll;
+      const hv = `<div class="dim" style="margin-top:8px">motor heurístico <b>v${esc(p.heur_version || "1.0")}</b></div>`;
+      const act = (p.active || []).map(a => `<div class="row" style="margin:6px 0;align-items:center">
+        <span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>
+        ${a.continuous ? ` <span class="pill amber">continuo</span>` : ""}
+        ${a.external ? ` <span class="pill accent">servicio docker</span>` : ""}
+        <span class="dim">· ${(a.hands || 0).toLocaleString()} manos</span>${(a.continuous && br && br.stack != null) ? ` <span class="dim">· stack <b>${br.stack}</b> · ${br.rebuys} rebuys</span>` : ""}
+        <span class="spacer"></span>
+        ${a.external ? "" : `<button class="btn sm destructive" data-stopprod="${esc(a.unit)}">parar</button>
+        <button class="btn sm" data-claim="${esc(a.label)}">🏆 reclamar</button>`}</div>`).join("");
       const q = (p.queue || []).map((it, i) => `<div class="row" style="margin:3px 0"><span class="dim">${i + 1}.</span> ${esc(it.agent)} <span class="dim">· ${esc(compName(it.competition || "eval"))}</span>
-        <button class="btn sm flat" data-dequeue="${i}">✕ quitar</button></div>`).join("") || `<div class="dim">cola vacía</div>`;
-      return `<h3 style="border:0;padding:10px 0 2px">Jugando</h3>${act}<h3 style="border:0;padding:8px 0 2px">Cola</h3>${q}`;
+        <button class="btn sm flat" data-dequeue="${i}">✕ quitar</button></div>`).join("");
+      return `<div style="margin-top:10px">${act || '<div class="empty">nada jugando ahora — elige agente + evento y pulsa ▶</div>'}</div>` +
+        (q ? `<div class="dim" style="margin-top:8px">cola</div>${q}` : "") + hv + `<div id="claim-msg" class="dim"></div>`;
     },
     renderRank() {
       const r = this.rank || [];
-      if (!r.length) return '<div class="empty">sin agentes puntuados aún — juega el Eval desde aquí</div>';
+      if (!r.length) return '<div class="empty">sin agentes puntuados aún</div>';
       const badge = a => a.kind === "eval" ? '<span class="pill green">Eval</span>' : `<span class="pill amber">${esc(a.type || "PvP")}</span>`;
-      const rows = r.map((a, i) => `<tr><td class="num">${i + 1}</td><td><b>${esc(a.name || a.label)}</b></td><td>${badge(a)}</td><td>${esc(a.strategy || "")}</td>
+      const rows = r.map((a, i) => `<tr><td class="num">${i + 1}</td><td><b>${esc(a.name || a.label)}</b></td><td>${badge(a)}</td>
         <td class="num"><b class="${(a.bb100 || 0) >= 0 ? "pos" : "neg"}">${a.bb100 == null ? "—" : (a.bb100 >= 0 ? "+" : "") + a.bb100}</b></td>
-        <td class="num">${a.hands || 0}</td><td><button class="btn sm" data-sel="${esc(a.label)}" data-selname="${esc(a.name || a.label)}">👁</button>${a.claimable ? ` <button class="btn sm" data-claim="${esc(a.label)}">🏆</button>` : ""} <button class="btn sm destructive" data-rankdel="${esc(a.label)}" title="quitar del ranking">🗑</button></td></tr>`).join("");
-      return `<table class="list"><thead><tr><th>#</th><th>agente</th><th>tipo</th><th>estrategia</th><th class="num">bb/100</th><th class="num">manos</th><th></th></tr></thead><tbody>${rows}</tbody></table><div id="claim-msg" class="dim" style="margin-top:6px"></div>`;
-    },
-    renderLive() {
-      const p = this.prod || {}, act = p.active || [], br = p.bankroll;
-      const hdr = `<div class="dim" style="margin-bottom:6px">motor heurístico <b>v${esc(p.heur_version || "1.0")}</b></div>`;
-      if (!act.length) return hdr + '<div class="empty">ningún agente jugando ahora — despliega uno arriba</div>';
-      return hdr + act.map(a => `<div class="row" style="margin:6px 0;align-items:center">
-        <span class="dot warn"></span> <b>${esc(a.agent || a.label)}</b> <span class="dim">· ${esc(compName(a.competition))}</span>${a.continuous ? ` <span class="pill amber">continuo</span>` : ""}
-        <span class="dim">· ${(a.hands || 0).toLocaleString()} manos</span>${(a.continuous && br && br.stack != null) ? ` <span class="dim">· stack <b>${br.stack}</b> · ${br.rebuys} rebuys</span>` : ""}
-        <span class="spacer"></span>
-        <button class="btn sm destructive" data-stopprod="${esc(a.unit)}">parar</button>
-        <button class="btn sm" data-claim="${esc(a.label)}">🏆 reclamar</button></div>`).join("");
+        <td class="num">${a.hands || 0}</td><td><button class="btn sm" data-sel="${esc(a.label)}" data-selname="${esc(a.name || a.label)}" title="ver sus stats">👁</button>${a.claimable ? ` <button class="btn sm" data-claim="${esc(a.label)}" title="reclamar">🏆</button>` : ""} <button class="btn sm destructive" data-rankdel="${esc(a.label)}" title="quitar del ranking">🗑</button></td></tr>`).join("");
+      return `<table class="list"><thead><tr><th>#</th><th>agente</th><th>tipo</th><th class="num">bb/100</th><th class="num">manos</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
     },
     renderSession() {
       const d = this.prodSession;
@@ -374,7 +424,7 @@ function app() {
         ? `<span class="pill amber">viendo «${esc(this.prodSelName || this.prodSel)}»</span> <button class="btn sm flat" data-selall="1">✕ todos</button>`
         : '<span class="dim">temporada actual · todos los deploys unificados</span>';
       const stats = `<div class="row" style="gap:14px;align-items:center;margin-bottom:6px">${tag}<span class="spacer"></span>
-        ${kpi("manos", (d.hands || 0).toLocaleString())}${kpi("decisiones", (d.decisions || 0).toLocaleString())}${kpi("M3 %", (d.m3pct || 0) + "%")}
+        ${kpi("manos", (d.hands || 0).toLocaleString())}${kpi("decisiones", (d.decisions || 0).toLocaleString())}${kpi("LLM %", (d.m3pct || 0) + "%")}
         ${kpi("bb/100 REAL", d.agg && d.agg.mean != null ? (d.agg.mean >= 0 ? "+" : "") + d.agg.mean : "—")}${kpi("bb/100 EV", d.agg && d.agg.adj != null ? (d.agg.adj >= 0 ? "+" : "") + d.agg.adj : "—")}</div>`;
       const posrow = `<div class="dim" style="margin-top:6px">VPIP / PFR por posición</div><div>${(d.bypos || []).map(p => `<span style="margin-right:10px">${p.pos} <b>${p.vpip}%</b>/<b>${p.pfr}%</b> <span class="dim">n${p.n}</span></span>`).join("") || '<span class="dim">—</span>'}</div>`;
       const grid = `<div class="dim">preflop · manos que jugamos (VPIP, 13×13)</div><div style="display:grid;grid-template-columns:repeat(13,1fr);gap:1px;max-width:460px;margin-top:4px">${heatGrid(d.classes || {})}</div>`;
@@ -390,7 +440,7 @@ function app() {
       else if (q) this.dequeue(+q.dataset.dequeue);
       else if (rd) this.rankDelete(rd.dataset.rankdel);
       else if (c) this.claim(c.dataset.claim);
-      else if (sel) { this.prodSel = sel.dataset.sel; this.prodSelName = sel.dataset.selname || sel.dataset.sel; this.loadHands(); this.loadSession(); }
+      else if (sel) { this.prodSel = sel.dataset.sel; this.prodSelName = sel.dataset.selname || sel.dataset.sel; this.loadSession(); }
       else if (all) { this.prodSel = ""; this.prodSelName = ""; this.loadSession(); }
       else if (k) this.openHand(decodeURIComponent(k.dataset.key));
     },
@@ -408,18 +458,18 @@ function app() {
       setTimeout(() => this.loadProd(), 900); },
     async stopProd(unit) { await jpost("/api/production/stop", { unit }); setTimeout(() => this.loadProd(), 700); },
     async dequeue(i) { await jpost("/api/production/queue-remove", { index: i }); setTimeout(() => this.loadProd(), 400); },
-    async claim(label) { const m = document.getElementById("claim-msg") || document.getElementById("prod-msg"); if (m) m.textContent = "obteniendo enlace de claim…";
+    async claim(label) { const m = document.getElementById("claim-msg"); if (m) m.textContent = "obteniendo enlace de claim…";
       const d = await jget("/api/claim?label=" + encodeURIComponent(label)); if (m) m.innerHTML = d.claim_url ? `🏆 <a href="${esc(d.claim_url)}" target="_blank" rel="noopener">${esc(d.claim_url)}</a>` : `<span class="neg">${esc(d.error || "sin claim_url")}</span>`; },
     renderEquity() {
       const st = this.state || {}, live = st.live_equity || {};
-      const eq = Object.keys(live).length ? live : (st.equity || {});   // S4 unificado (todos los deploys); si no hay, histórico
+      const eq = Object.keys(live).length ? live : (st.equity || {});   // temporada unificada (todos los deploys); si no hay, histórico
       return equityChart(eq, this.eqOpt);
     },
 
     async loadHands() { const d = await jget("/api/hands"); this.hands = d.hands || []; },
     renderHands() {
       const f = (this.handFilter || "").toLowerCase().trim();
-      let rows = this.hands;   // todas las manos de la temporada actual (S4), unificadas — sin filtro por run/deploy
+      let rows = this.hands;   // todas las manos de la temporada actual, unificadas — sin filtro por run/deploy
       if (this.llmOnly) rows = rows.filter(h => h.m3 > 0);
       rows = rows.filter(h => !f || (h.pos || "").toLowerCase().includes(f) || (h.hole || "").toLowerCase().includes(f)
         || (h.hclass || "").toLowerCase().includes(f) || (h.reached || "").toLowerCase().includes(f) || (h.label || "").toLowerCase().includes(f)
@@ -429,16 +479,39 @@ function app() {
     },
     async loadOpponents() { const d = await jget("/api/tracker/opponents"); this.opponents = d.opponents || []; },
     renderOpponents() {
-      if (!this.opponents.length) return '<div class="empty">sin rivales aún — se llena solo durante el juego (HUD del Arena)</div>';
+      if (!this.opponents.length) return '<div class="empty">sin rivales aún — se llena solo durante el juego</div>';
       return `<div class="dim" style="font-size:11px;margin-bottom:5px">clic en un rival → su ficha (manos mostradas + stats)</div><table class="list"><thead><tr><th>rival</th><th>estilo</th><th class="num">N</th><th class="num">VPIP</th><th class="num">PFR</th><th class="num">AF</th><th class="num">WTSD</th><th class="num">vistas</th></tr></thead><tbody>${this.opponents.map(o => `<tr class="clk" data-opp="${esc(o.agent_id)}" style="cursor:pointer"><td><b>${esc(o.name || o.agent_id)}</b></td><td>${o.adapting ? `<span class="pill green">${esc(o.archetype)} · adaptando</span>` : `<span class="dim">${o.archetype === "UNKNOWN" ? "&lt;500 manos" : esc(o.archetype || "?")}</span>`}</td><td class="num">${o.n == null ? "—" : Number(o.n).toLocaleString()}</td><td class="num">${pct(o.vpip)}</td><td class="num">${pct(o.pfr)}</td><td class="num">${o.af == null ? "—" : (+o.af).toFixed(1)}</td><td class="num">${pct(o.wtsd)}</td><td class="num">${o.shown_hands || 0}</td></tr>`).join("")}</tbody></table>`;
     },
     async harvest() { await jpost("/api/tracker/harvest", {}); setTimeout(() => this.loadOpponents(), 1500); },
+
+    /* ───── MODELOS ───── */
     async loadSettings() {
       this.settings = await jget("/api/settings");
       this.liveModel = (this.settings.live || {}).id || "";
       this.defModel = (this.settings.default || {}).id || "";
     },
     providerReady(p) { return !!((this.settings.providers || {})[p]); },
+    renderModelRecs() {
+      const recs = this.settings.recs || [];
+      if (!recs.length) return '<div class="empty">cargando…</div>';
+      const rows = recs.map(r => {
+        const prov = (r.id || "").split(":", 1)[0];
+        const ready = this.providerReady(prov);
+        const price = (r.pin == null) ? '<span class="dim">—</span>' : `$${r.pin} / $${r.pout}`;
+        const cur = ((this.settings.live || {}).id === r.id) ? ' <span class="pill green">en vivo</span>' : "";
+        return `<tr><td><b>${esc(r.name)}</b>${cur}<div class="dim" style="font-size:11px">${esc(r.id)}</div></td>
+          <td class="num" style="white-space:nowrap">${price}</td>
+          <td class="num dim">${r.ctx ? (r.ctx / 1000).toFixed(0) + "k" : "—"}</td>
+          <td class="dim" style="white-space:normal;max-width:420px;font-size:12px">${esc(r.why)}</td>
+          <td class="num">${ready ? `<button class="btn sm suggested" data-usemodel="${esc(r.id)}">⚡ usar en vivo</button>` : `<span class="pill amber" title="configura la key de ${esc(prov)} abajo">sin key</span>`}</td></tr>`;
+      }).join("");
+      return `<table class="list"><thead><tr><th>modelo</th><th class="num">$ in / out</th><th class="num">ctx</th><th>por qué</th><th></th></tr></thead><tbody>${rows}</tbody></table>`;
+    },
+    onModelsClick(e) {
+      const b = e.target.closest("[data-usemodel]"); if (!b) return;
+      this.liveModel = b.dataset.usemodel; this.liveCustom = "";
+      this.applyLive();
+    },
     async saveKey(provider) {
       const key = (this.keyInput[provider] || "").trim(), base = (this.baseInput[provider] || "").trim();
       if (!key && !base) { this.settingsMsg = "pega una API key primero"; return; }
@@ -449,16 +522,21 @@ function app() {
       setTimeout(() => { this.settingsMsg = ""; }, 4000);
     },
     async applyLive() {
-      if (!this.liveModel) return;
-      await jpost("/api/settings/model", { scope: "live", model: this.liveModel });
+      const mid = (this.liveCustom || "").trim() || this.liveModel;
+      if (!mid) return;
+      const r0 = await jpost("/api/settings/model", { scope: "live", model: mid });
+      if (r0.error) { this.settingsMsg2 = "error: " + r0.error; setTimeout(() => { this.settingsMsg2 = ""; }, 6000); return; }
       const r = await jpost("/api/settings/apply", {});
-      this.settingsMsg2 = r.error ? ("error: " + r.error) : (r.note || ("aplicado en vivo: " + this.liveModel + " (re-desplegado)"));
+      this.settingsMsg2 = r.error ? ("error: " + r.error) : (r.note || ("aplicado en vivo: " + mid + " (re-desplegado)"));
+      await this.loadSettings();
       setTimeout(() => { this.settingsMsg2 = ""; }, 6000);
     },
     async saveDefault() {
-      if (!this.defModel) return;
-      const r = await jpost("/api/settings/model", { scope: "default", model: this.defModel });
-      this.settingsMsg2 = r.error ? ("error: " + r.error) : ("default: " + this.defModel + " ✓");
+      const mid = (this.defCustom || "").trim() || this.defModel;
+      if (!mid) return;
+      const r = await jpost("/api/settings/model", { scope: "default", model: mid });
+      this.settingsMsg2 = r.error ? ("error: " + r.error) : ("default: " + mid + " ✓");
+      await this.loadSettings();
       setTimeout(() => { this.settingsMsg2 = ""; }, 4000);
     },
 

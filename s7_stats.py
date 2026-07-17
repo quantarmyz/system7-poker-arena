@@ -108,6 +108,19 @@ def init():
             opp_id TEXT PRIMARY KEY, ts REAL, name TEXT, n INTEGER, vpip REAL, pfr REAL,
             af REAL, bluff_pct REAL, wtsd REAL, wsd REAL, style TEXT,
             shown_hands INTEGER, last_seen REAL)""")
+        # ── Evolution system (s7_evolve) ───────────────────────────────
+        c.execute("""CREATE TABLE IF NOT EXISTS proposals(
+            id TEXT PRIMARY KEY, ts REAL, type TEXT, status TEXT,
+            version TEXT, config TEXT, prose TEXT, agent TEXT, game TEXT,
+            by TEXT, approved_by TEXT, approved_at REAL,
+            rejected_at REAL, rejected_reason TEXT, note TEXT)""")
+        c.execute("""CREATE TABLE IF NOT EXISTS proposal_actions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, proposal_id TEXT,
+            action TEXT, by TEXT, at REAL, note TEXT)""")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_proposals_status ON proposals(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_proposals_ts ON proposals(ts)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_prop_actions_proposal ON proposal_actions(proposal_id)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_proposals_version ON proposals(version)")
 
 
 def log_decision(d: dict):

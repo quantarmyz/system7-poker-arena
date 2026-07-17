@@ -72,11 +72,11 @@ def test_pme_per():
 
 
 def test_perejil_thresholds():
-    assert d._perejil_ok(8, 3, 1, False) is True      # flop, 8 outs HU
-    assert d._perejil_ok(7, 3, 1, False) is False     # flop needs 8
-    assert d._perejil_ok(10, 4, 1, False) is True     # turn needs 10
-    assert d._perejil_ok(8, 3, 2, False) is False     # +1 for extra villain
-    assert d._perejil_ok(6, 3, 1, True) is True       # overfolder: -2 relax
+    assert d._perejil_ok(6, 3, 1, False) is True      # flop, 6 outs HU (v1.5: 6/8)
+    assert d._perejil_ok(5, 3, 1, False) is False     # flop needs 6
+    assert d._perejil_ok(8, 4, 1, False) is True      # turn needs 8
+    assert d._perejil_ok(6, 3, 2, False) is False     # +1 for extra villain
+    assert d._perejil_ok(4, 3, 1, True) is True       # overfolder: -2 relax
 
 
 # ── HUD archetypes ────────────────────────────────────────────────────────────

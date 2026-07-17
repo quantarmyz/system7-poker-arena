@@ -54,3 +54,7 @@ htmlcov/
 data/
 .jobs/
 report.md
+
+# Runtime artifacts
+*.log
+.deleted.*

@@ -5,22 +5,13 @@ function esc(s){return String(s==null?"":s).replace(/[&<>"]/g,c=>({"&":"&amp;","
 function ch(c){if(!c)return"";const up=c.toUpperCase();const r=up.startsWith("10")?"T":up[0];const s=c.slice(-1).toLowerCase();
   const red=(s==="h"||s==="d");const su={h:"♥",d:"♦",s:"♠",c:"♣"}[s]||"";return `<span class="pc${red?" red":""}">${r}${su}</span>`;}
 function chs(str){return (str||"").split(/[,\s]+/).filter(Boolean).map(ch).join("");}
-function sgn(v){return v==null?'<span class="dim">—</span>':(v>0?`<span class="pos">+${v}</span>`:(v<0?`<span class="neg">${v}</span>`:"<span>0</span>"));}
 function pct(x){return x==null?"—":((Math.abs(x)<=1?x*100:x).toFixed(1)+"%");}
 function tt(ts){return ts?new Date(ts*1000).toLocaleTimeString():"";}
-function combo(i,j){if(i===j)return RANKS[i]+RANKS[i];return i<j?RANKS[i]+RANKS[j]+"s":RANKS[j]+RANKS[i]+"o";}
+function combo(i,j){if(i===j)return RANKS[i]+RANKS[j];return i<j?RANKS[i]+RANKS[j]+"s":RANKS[j]+RANKS[i]+"o";}
 
 function meter(label,val,max,suffix){const w=Math.max(2,Math.min(100,100*val/(max||1)));
   return `<div class="row" style="gap:8px;margin:3px 0"><span class="dim" style="width:44px">${label}</span>
     <div class="meter" style="flex:1"><i style="width:${w}%"></i><span>${val}${suffix||""}</span></div></div>`;}
-
-function spark(arr,w=160,h=30){if(!arr||!arr.length)return"";
-  const mn=Math.min(0,...arr),mx=Math.max(0,...arr),rng=(mx-mn)||1;
-  const pts=arr.map((v,i)=>[(arr.length<2?0:i/(arr.length-1))*(w-4)+2,h-2-((v-mn)/rng)*(h-4)]);
-  const d=pts.map((p,i)=>(i?"L":"M")+p[0].toFixed(1)+" "+p[1].toFixed(1)).join(" ");
-  const zy=(h-2-((0-mn)/rng)*(h-4)).toFixed(1);
-  return `<svg width="${w}" height="${h}"><line x1="0" y1="${zy}" x2="${w}" y2="${zy}" stroke="var(--border)"/>
-    <path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.5"/></svg>`;}
 
 /* Curva equity REAL vs EV por estrategia/agente */
 function equityChart(eqd, opt){

@@ -40,8 +40,13 @@ def _key():
               os.path.join(_HERE, ".arena-credentials"),
               "/data/.arena-credentials"):
         if p and os.path.exists(p):
-            with open(p) as f:
-                return json.load(f)["apiKey"]
+            try:
+                with open(p) as f:
+                    k = (json.load(f) or {}).get("apiKey")
+                if k:
+                    return k
+            except Exception:
+                pass
     raise SystemExit("no creds: set S7_CREDS_FILE or provide .arena-credentials")
 
 

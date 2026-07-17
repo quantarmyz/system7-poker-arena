@@ -50,3 +50,4 @@ services:
       <<: *common-env
       S7_STRAT: s7-opus
       S7_CREDS_FILE: /data/.arena-pg-credentials
+      S7_PVP_LOCK: /data/.pvp-cash.lock    # mismo lock que el dashboard → nunca 2 bucles PvP

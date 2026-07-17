@@ -28,5 +28,5 @@
       "extreme": {"flop": 0.75, "turn": 0.80, "river": 0.80}
     }
   },
-  "note": "HU Ladder v2.0: SB ~65% RFI, BB ~58% defense, survival tiers, anti-maniac trapping, anti-NIT c-bet, perejil 6/8."
+  "note": "HU Ladder v2.0: SB ~65% RFI, BB ~58% defense, anti-maniac trapping, anti-NIT c-bet, survival tiers, perejil 6/8."
 }

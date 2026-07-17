@@ -25,13 +25,14 @@ RANKS = "AKQJT98765432"
 
 
 def _load_env():
-    """Load OPENAI_* / S7_MODEL from .env so the COACH can call M3."""
+    """Load every KEY=VAL from .env into os.environ (setdefault — real env wins)."""
     try:
         for ln in open(os.path.join(HERE, ".env")):
             ln = ln.strip()
             if ln and not ln.startswith("#") and "=" in ln:
                 k, v = ln.split("=", 1)
-                if k in ("OPENAI_API_KEY", "OPENAI_BASE_URL", "S7_MODEL"):
+                k = k.strip()
+                if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,60}", k):
                     os.environ.setdefault(k, v.strip().strip('"').strip("'"))
     except Exception:
         pass
@@ -60,6 +61,7 @@ try:
 except Exception:
     s7_mllm = None
 import s7_jobs        # run backend: systemd on the LXC, plain subprocess in Docker (auto-detected)
+import s7_stats       # recorder SQLite (schema init en __main__)
 import s7_api         # nuevos endpoints del rediseño (LAB · PRODUCCIÓN · TRACKER)
 CLASIF_DIR = os.environ.get("S7_CLASIF_DIR", os.path.join(HERE, ".clasif"))
 _cache = {}                       # state cache por game (cash/tournament)
@@ -1159,7 +1161,8 @@ def _claim(label):
         return {"error": "sin credenciales para '" + str(label) + "'"}
     try:
         import urllib.request
-        req = urllib.request.Request("https://arena.dev.fun/api/arena/auth/claim/status",
+        _base = os.environ.get("ARENA_API_BASE", "https://arena.dev.fun/api/arena")
+        req = urllib.request.Request(_base.rstrip("/") + "/auth/claim/status",
                                      headers={"x-arena-api-key": creds.get("apiKey", "")})
         with urllib.request.urlopen(req, timeout=15) as r:
             data = json.loads(r.read().decode())
@@ -1173,25 +1176,49 @@ def _claim(label):
             "claim_url": url, "raw": data}
 
 
+# Presets del selector de modelo. tag: "flash" = cabe en el reloj del Playground;
+# "pro" = potente pero lento (solo Eval/coach); "avoid" = reasoner (timeout → fallback).
 MLLM_PRESETS = [
-    {"id": "minimax:MiniMax-M3", "provider": "minimax", "label": "MiniMax M3 (actual)"},
-    {"id": "openrouter:openai/gpt-4o", "provider": "openrouter", "label": "GPT-4o"},
-    {"id": "openrouter:openai/gpt-4.1", "provider": "openrouter", "label": "GPT-4.1"},
-    {"id": "openrouter:anthropic/claude-3.7-sonnet", "provider": "openrouter", "label": "Claude 3.7 Sonnet"},
-    {"id": "openrouter:deepseek/deepseek-r1", "provider": "openrouter", "label": "DeepSeek R1"},
-    {"id": "openrouter:google/gemini-2.5-pro", "provider": "openrouter", "label": "Gemini 2.5 Pro"},
-    {"id": "openrouter:meta-llama/llama-3.3-70b-instruct", "provider": "openrouter", "label": "Llama 3.3 70B"},
-    {"id": "openrouter:qwen/qwen-2.5-72b-instruct", "provider": "openrouter", "label": "Qwen 2.5 72B"},
-    {"id": "xiaomi:MiMo-7B-RL", "provider": "xiaomi", "label": "Xiaomi MiMo"},
-    {"id": "minimax:MiniMax-M2", "provider": "minimax", "label": "MiniMax M2 (rápido · vivo)"},
-    {"id": "deepseek:deepseek-chat", "provider": "deepseek", "label": "DeepSeek V3 (rápido)"},
-    {"id": "deepseek:deepseek-reasoner", "provider": "deepseek", "label": "DeepSeek R1 (lento)"},
+    {"id": "openrouter:deepseek/deepseek-v3.2", "provider": "openrouter", "label": "DeepSeek V3.2", "tag": "flash"},
+    {"id": "openrouter:google/gemini-2.5-flash", "provider": "openrouter", "label": "Gemini 2.5 Flash", "tag": "flash"},
+    {"id": "openrouter:google/gemini-2.5-flash-lite", "provider": "openrouter", "label": "Gemini 2.5 Flash Lite", "tag": "flash"},
+    {"id": "openrouter:openai/gpt-4.1-mini", "provider": "openrouter", "label": "GPT-4.1 mini", "tag": "flash"},
+    {"id": "openrouter:qwen/qwen3-235b-a22b-2507", "provider": "openrouter", "label": "Qwen3 235B", "tag": "flash"},
+    {"id": "openrouter:meta-llama/llama-3.3-70b-instruct", "provider": "openrouter", "label": "Llama 3.3 70B", "tag": "flash"},
+    {"id": "minimax:MiniMax-M2", "provider": "minimax", "label": "MiniMax M2", "tag": "flash"},
+    {"id": "deepseek:deepseek-chat", "provider": "deepseek", "label": "DeepSeek V3 (directo)", "tag": "flash"},
+    {"id": "minimax:MiniMax-M3", "provider": "minimax", "label": "MiniMax M3", "tag": "pro"},
+    {"id": "openrouter:openai/gpt-4.1", "provider": "openrouter", "label": "GPT-4.1", "tag": "pro"},
+    {"id": "openrouter:anthropic/claude-sonnet-4.5", "provider": "openrouter", "label": "Claude Sonnet 4.5", "tag": "pro"},
+    {"id": "openrouter:google/gemini-2.5-pro", "provider": "openrouter", "label": "Gemini 2.5 Pro", "tag": "pro"},
+    {"id": "deepseek:deepseek-reasoner", "provider": "deepseek", "label": "DeepSeek R1 (reasoner)", "tag": "avoid"},
+    {"id": "openrouter:deepseek/deepseek-r1", "provider": "openrouter", "label": "DeepSeek R1 via OR (reasoner)", "tag": "avoid"},
+]
+
+# Recomendaciones curadas para la pestaña MODELOS (precios $/1M tok, jul 2026 — orientativos).
+MODEL_RECS = [
+    {"id": "openrouter:deepseek/deepseek-v3.2", "name": "DeepSeek V3.2", "ctx": 164000,
+     "pin": 0.27, "pout": 0.40, "why": "El 'DeepSeek pro': muy rápido, buen JSON, barato. Recomendación #1 para jugar."},
+    {"id": "openrouter:google/gemini-2.5-flash", "name": "Gemini 2.5 Flash", "ctx": 1048576,
+     "pin": 0.30, "pout": 2.50, "why": "Flash nativo de Google; latencia mínima y fiable siguiendo formato."},
+    {"id": "openrouter:google/gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "ctx": 1048576,
+     "pin": 0.10, "pout": 0.40, "why": "El más barato/rápido; para volumen alto de manos."},
+    {"id": "openrouter:openai/gpt-4.1-mini", "name": "GPT-4.1 mini", "ctx": 1047576,
+     "pin": 0.40, "pout": 1.60, "why": "Mini de OpenAI: obediente con el contrato JSON, baja latencia."},
+    {"id": "openrouter:qwen/qwen3-235b-a22b-2507", "name": "Qwen3 235B", "ctx": 262144,
+     "pin": 0.09, "pout": 0.55, "why": "Gran calidad/precio; versión NO-thinking (la thinking hace timeout)."},
+    {"id": "openrouter:meta-llama/llama-3.3-70b-instruct", "name": "Llama 3.3 70B", "ctx": 131072,
+     "pin": 0.13, "pout": 0.40, "why": "Open weights, rápido y suficiente para decisiones estándar."},
+    {"id": "minimax:MiniMax-M2", "name": "MiniMax M2", "ctx": 200000,
+     "pin": None, "pout": None, "why": "El que mejor medimos en vivo (~9s/decisión). Plan del usuario."},
+    {"id": "deepseek:deepseek-chat", "name": "DeepSeek V3 (API directa)", "ctx": 131072,
+     "pin": 0.20, "pout": 0.80, "why": "Sin pasar por OpenRouter; misma familia, latencia directa."},
 ]
 
 
 def _mllm_models():
     prov = {p: bool(s7_mllm and s7_mllm.provider_ready(p)) for p in ("minimax", "openrouter", "xiaomi", "deepseek")}
-    return {"presets": MLLM_PRESETS, "providers": prov}
+    return {"presets": MLLM_PRESETS, "providers": prov, "recs": MODEL_RECS}
 
 
 def _mllm_runs():
@@ -1305,7 +1332,13 @@ def _rank():
         deploys = s7_api._jload(s7_api._DEPLOYS_PATH, {})
     except Exception:
         deploys = {}
-    _names = {"cmqf827h30u7dfca3x2aqvzjv": "Playground", "cmqggiv9k37am11ydmppz466e": "Torneo"}
+    _names = {}
+    for _g in ("cash", "tournament"):                    # ids de temporada → nombres, dinámico (rollover-safe)
+        try:
+            _ids, _ = s7_api._active_comps(_g)
+            _names.update(_ids)
+        except Exception:
+            pass
     my = _my_agent_id()
     rows = []
     for lbl in set(creds) | set(deploys):
@@ -1415,6 +1448,9 @@ class H(BaseHTTPRequestHandler):
         if p.startswith("/api/production/competitions"):
             self._send(json.dumps(s7_api.production_competitions(s7_api.curgame()), default=str), "application/json")
             return
+        if p.startswith("/api/seasons"):
+            self._send(json.dumps(s7_api.season_status(), default=str), "application/json")
+            return
         if p.startswith("/api/production/account"):
             self._send(json.dumps(s7_api.production_account(), default=str), "application/json")
             return
@@ -1428,6 +1464,21 @@ class H(BaseHTTPRequestHandler):
             return
         if p.startswith("/api/tracker/opponents"):
             self._send(json.dumps(s7_api.tracker_opponents(), default=str), "application/json")
+            return
+        # ── Evolution endpoints ──────────────────────────────────────────
+        if p.startswith("/api/evolve/pending"):
+            self._send(json.dumps({"pending": _get_evolve_pending()}, default=str), "application/json")
+            return
+        if p.startswith("/api/evolve/proposal"):
+            from urllib.parse import urlparse, parse_qs
+            pid = parse_qs(urlparse(p).query).get("id", [""])[0]
+            self._send(json.dumps(_get_evolve_proposal(pid), default=str), "application/json")
+            return
+        if p.startswith("/api/evolve/history"):
+            self._send(json.dumps({"history": _get_evolve_history()}, default=str), "application/json")
+            return
+        if p.startswith("/api/evolve/status"):
+            self._send(json.dumps(_get_evolve_status(), default=str), "application/json")
             return
         if p.startswith("/api/opponent"):
             _oid = _pq(_up(p).query).get("id", [""])[0]
@@ -1579,9 +1630,17 @@ class H(BaseHTTPRequestHandler):
             reply(s7_api.settings_set_model(body)); return
         if p.startswith("/api/settings/apply"):
             reply(s7_api.settings_apply_live(body)); return
+        if p.startswith("/api/settings/interval"):
+            reply(s7_api.settings_set_interval(body)); return
+        if p.startswith("/api/seasons/reresolve"):
+            reply(s7_api.season_reresolve(body)); return
         if p.startswith("/api/strats/save"):
             reply(_save_strat(body))
             return
+        if p.startswith("/api/evolve/approve"):
+            reply(_send_evolve_approve(body)); return
+        if p.startswith("/api/evolve/reject"):
+            reply(_send_evolve_reject(body)); return
         if p.startswith("/api/run/stop"):
             unit = str(body.get("unit", ""))
             if re.fullmatch(r"arena-(run-[a-z0-9_-]{1,24}|test|test-wide)(\.service)?", unit):
@@ -1743,7 +1802,104 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+# ── Evolution loop ─────────────────────────────────────────────────────────────
+def _evolve_loop():
+    """Background loop: calls s7_evolve._run_evolution_cycle() every 30s.
+    s7_evolve._evolve_pending es la única fuente de verdad del badge."""
+    try:
+        import s7_evolve
+    except Exception:
+        return
+    while True:
+        try:
+            result = s7_evolve._run_evolution_cycle()
+            if result and result.get("ok"):
+                print("[s7-evolve] new proposal: %s (%d hands, %d leaks)" % (
+                    result.get("version"), result.get("hands"), len(result.get("leaks", []))), flush=True)
+        except Exception:
+            pass
+        time.sleep(30)
+
+
+def _get_evolve_pending():
+    """GET /api/evolve/pending"""
+    try:
+        import s7_evolve
+        return {"pending": s7_evolve.get_pending()}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _get_evolve_proposal(proposal_id):
+    """GET /api/evolve/proposal?id=X"""
+    try:
+        import s7_evolve
+        p = s7_evolve.get_proposal_detail(proposal_id)
+        if not p:
+            return {"error": "proposal not found"}
+        return {"proposal": p}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _get_evolve_history():
+    """GET /api/evolve/history"""
+    try:
+        import s7_evolve
+        game = None
+        try:
+            game = s7_api.curgame()
+        except Exception:
+            pass
+        return {"history": s7_evolve.get_history(game)}
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _get_evolve_status():
+    """GET /api/evolve/status"""
+    try:
+        import s7_evolve
+        return s7_evolve.get_evolve_status()
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _send_evolve_approve(body):
+    """POST /api/evolve/approve"""
+    try:
+        import s7_evolve
+        pid = str(body.get("id", "")).strip()
+        by = str(body.get("by", "user")).strip()
+        note = str(body.get("note", "")).strip()
+        return s7_evolve._approve(pid, by, note)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
+def _send_evolve_reject(body):
+    """POST /api/evolve/reject"""
+    try:
+        import s7_evolve
+        pid = str(body.get("id", "")).strip()
+        by = str(body.get("by", "user")).strip()
+        reason = str(body.get("reason", "")).strip()
+        note = str(body.get("note", "")).strip()
+        return s7_evolve._reject(pid, by, reason, note)
+    except Exception as e:
+        return {"error": str(e)[:200]}
+
+
 if __name__ == "__main__":
+    _db0 = s7_stats.DB
+    for _db in dict.fromkeys([_db0, s7_api.DB_CASH, s7_api.DB_TOURNEY]):
+        try:                             # schema al día en cash + torneo (incluye tablas evolve)
+            s7_stats.DB = _db
+            s7_stats.init()
+        except Exception as e:
+            print("[s7-dash] init db %s: %s" % (_db, str(e)[:120]), flush=True)
+    s7_stats.DB = _db0
     print(f"[s7-dash] serving http://0.0.0.0:{PORT}  db={DB}", flush=True)
     threading.Thread(target=s7_api.queue_loop, daemon=True).start()   # procesa la cola de producción (1 a la vez)
+    threading.Thread(target=_evolve_loop, daemon=True).start()         # evolution loop: coach → proposal → human approval
     ThreadingHTTPServer(("0.0.0.0", PORT), H).serve_forever()

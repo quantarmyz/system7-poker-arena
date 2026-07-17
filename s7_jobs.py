@@ -64,9 +64,11 @@ def _meta(label):
         return None
 
 
-def _alive(pid):
+def _alive(pid, argv=None):
     """True only if the process exists AND is not a zombie (a killed-but-unreaped
-    child still answers kill(pid,0), so check /proc state on Linux)."""
+    child still answers kill(pid,0), so check /proc state on Linux) AND — when the
+    job argv is known — its cmdline still matches the job (pids get recycled when
+    the container restarts; a stale registry must not mark random processes active)."""
     try:
         pid = int(pid)
     except Exception:
@@ -74,15 +76,27 @@ def _alive(pid):
     try:
         with open("/proc/%d/stat" % pid) as f:
             state = f.read().rsplit(") ", 1)[1].split(" ", 1)[0]
-        return state not in ("Z", "X", "x")
+        if state in ("Z", "X", "x"):
+            return False
     except FileNotFoundError:
         return False
     except Exception:
         try:
             os.kill(pid, 0)
-            return True
         except Exception:
             return False
+    if argv:
+        try:
+            with open("/proc/%d/cmdline" % pid, "rb") as f:
+                cmd = f.read().replace(b"\0", b" ").decode("utf-8", "replace")
+            script = next((a for a in argv if str(a).endswith(".py")), None)
+            if script and os.path.basename(str(script)) not in cmd:
+                return False
+        except FileNotFoundError:
+            return False
+        except Exception:
+            pass
+    return True
 
 
 def _reap():
@@ -121,9 +135,11 @@ def launch(label, argv, env=None):
                              stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
     finally:
         logf.close()
+    safe_env = {k: ("***" if ("KEY" in k or "TOKEN" in k or "SECRET" in k) else v)
+                for k, v in env.items()}           # no persistir secretos en disco
     with open(os.path.join(JOBS_DIR, label + ".json"), "w", encoding="utf-8") as f:
         json.dump({"label": label, "pid": p.pid, "argv": list(argv),
-                   "started": time.time(), "env": env}, f)
+                   "started": time.time(), "env": safe_env}, f)
     _PROCS[label] = p
     return "arena-run-" + label
 
@@ -191,9 +207,10 @@ def list_jobs():
             if not fn.endswith(".json"):
                 continue
             label = fn[:-5]
-            pid = (_meta(label) or {}).get("pid")
+            meta = _meta(label) or {}
+            pid = meta.get("pid")
             out.append({"unit": "arena-run-" + label, "label": label,
-                        "state": "active" if (pid and _alive(pid)) else "inactive"})
+                        "state": "active" if (pid and _alive(pid, meta.get("argv"))) else "inactive"})
     except FileNotFoundError:
         pass
     return out
@@ -224,5 +241,5 @@ def is_active(name):
             return "?"
     meta = _meta(_label(name))
     if meta:
-        return "active" if _alive(meta.get("pid", 0)) else "inactive"
+        return "active" if _alive(meta.get("pid", 0), meta.get("argv")) else "inactive"
     return "n/a"

@@ -221,9 +221,12 @@ def _jload(path, default):
 
 
 def _jwrite(path, obj):
+    """Atomic JSON write (tmp + rename) — never leaves a half-written state file."""
     try:
-        with open(path, "w") as f:
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(obj, f)
+        os.replace(tmp, path)
     except Exception:
         pass
 
@@ -298,6 +301,29 @@ def _prod_active():
     return [j for j in s7_jobs.list_jobs() if j["label"].startswith("prod-") and j["state"] == "active"]
 
 
+def _pvp_lock_path(game):
+    return "/data/.pvp-%s.lock" % game if os.path.isdir("/data") else os.path.join(HERE, ".pvp-%s.lock" % game)
+
+
+def _pvp_lock_held(game):
+    """True si OTRO proceso tiene el flock del PvP de ese game (p.ej. el servicio compose
+    pvp, que comparte el volumen /data). Evita lanzar un 2º bucle PvP (double actions)."""
+    import fcntl
+    try:
+        f = open(_pvp_lock_path(game), "a+")
+        try:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        finally:
+            pass
+        fcntl.flock(f, fcntl.LOCK_UN)
+        f.close()
+        return False
+    except Exception:
+        return False
+
+
 def _is_continuous(competition):
     """Playground/torneo (run_pvp) = bucle continuo (no acaba solo); Eval = one-shot."""
     return str(competition or "") not in ("eval", "seed_poker_eval_s1", "")
@@ -309,7 +335,7 @@ def _prod_launch(agent, competition):
         return {"error": "perfil no encontrado"}
     import secrets as _sec
     game = p.get("game", "cash")
-    env = {"S7_STATS_DB": _dbpath(game), "S7_PVP_LOCK": "/data/.pvp-%s.lock" % game}   # lock por game → Playground (cash) y Tournament (torneo) conviven
+    env = {"S7_STATS_DB": _dbpath(game), "S7_PVP_LOCK": _pvp_lock_path(game)}   # lock por game → Playground (cash) y Tournament (torneo) conviven
     env.update(s7_agents.env_for(p))
     label = "prod-" + _sec.token_hex(4)
     if competition in ("eval", "seed_poker_eval_s1", ""):
@@ -319,6 +345,8 @@ def _prod_launch(agent, competition):
         argv = s7_jobs.pyrun("s7_test.py", "--engine", p.get("engine", "hybrid"), "--matches", "1")
         compname = "Eval S1"
     else:
+        if _pvp_lock_held(game):
+            return {"error": "ya hay un bucle PvP vivo para este game (lock ocupado) — para ese primero"}
         env["ARENA_COMPETITION_ID"] = competition
         env["S7_CREDS_FILE"] = os.path.join(_DATA, ".arena-pg-credentials")
         env["S7_RUN_LABEL"] = "playground"      # agrupa TODOS los deploys del Playground bajo UN agente
@@ -422,10 +450,18 @@ def production_status():
     except Exception:
         pass
 
+    try:                                   # ids de temporada → nombres vivos (Eval se queda como está)
+        _names, _live = _active_comps(_g)
+    except Exception:
+        _names = {}
+
     def mk(j):
         m = deploys.get(j["label"], {})
+        comp = m.get("compname") or m.get("competition")
+        if comp and comp in _names:
+            comp = _names[comp]
         return {"label": j["label"], "unit": j["unit"], "state": j["state"],
-                "agent": m.get("agent"), "competition": m.get("compname") or m.get("competition"),
+                "agent": m.get("agent"), "competition": comp,
                 "continuous": _is_continuous(m.get("competition")),
                 "hands": hpl.get(m.get("run_label") or j["label"], 0)}   # por run_label del deploy (Playground agrupado)
     try:
@@ -433,7 +469,17 @@ def production_status():
         _hv = getattr(_DS, "VERSION", "1.0")
     except Exception:
         _hv = "1.0"
-    return {"running": bool(active), "active": [mk(j) for j in active],
+    act = [mk(j) for j in active]
+    if not act and _pvp_lock_held(_g):
+        try:                                   # PvP gestionado fuera del dashboard (p.ej. servicio compose pvp)
+            _ids, _c = _active_comps(_g)
+            _ra = (_jload(_RESUME_PATH, {}).get(_g) or {}).get("agent")
+            act.append({"label": "pvp-externo", "unit": "", "state": "active", "external": True,
+                        "agent": _ra or "pvp", "competition": (_c or {}).get("name") or "Playground",
+                        "continuous": True, "hands": hpl.get("playground", 0)})
+        except Exception:
+            pass
+    return {"running": bool(act), "active": act,
             "jobs": [mk(j) for j in jobs], "queue": _jload(_QUEUE_PATH, []),
             "bankroll": snap, "heur_version": _hv}
 
@@ -462,9 +508,8 @@ def production_stop(body):
     return {"ok": True}
 
 
-# ── Settings: API keys de proveedores LLM (.env) + modelo vivo/default ──────────
+# ── Settings: API keys de proveedores LLM + modelo vivo/default (/data/settings.json) ──
 _SETTINGS_PATH = os.path.join(_DATA, "settings.json")
-_ENV_PATH = os.path.join(HERE, ".env")
 _PROV_KEY_ENV = {"minimax": "OPENAI_API_KEY", "xiaomi": "XIAOMI_API_KEY",
                  "openrouter": "OPENROUTER_API_KEY", "deepseek": "DEEPSEEK_API_KEY"}
 _PROV_BASE_ENV = {"minimax": "OPENAI_BASE_URL", "xiaomi": "XIAOMI_BASE_URL",
@@ -483,38 +528,28 @@ def _settings_save(d):
         pass
 
 
-def _env_upsert(var, val):
-    """Reemplaza/añade VAR=val en .env (preserva el resto) + os.environ."""
-    if not re.fullmatch(r"[A-Z][A-Z0-9_]{1,40}", var or ""):
-        return False
-    try:
-        lines = open(_ENV_PATH, encoding="utf-8").read().splitlines()
-    except Exception:
-        lines = []
-    out, found = [], False
-    for ln in lines:
-        if ln.split("=", 1)[0].strip() == var:
-            out.append("%s=%s" % (var, val)); found = True
-        else:
-            out.append(ln)
-    if not found:
-        out.append("%s=%s" % (var, val))
-    try:
-        with open(_ENV_PATH, "w", encoding="utf-8") as f:
-            f.write("\n".join(out) + "\n")
-    except Exception:
-        return False
-    os.environ[var] = val
-    return True
-
-
 def settings_get():
     """Modelo vivo/default + estado por proveedor (ENMASCARADO: nunca devuelve el valor de la key)."""
     _apply_settings_keys()
     st = _settings()
     keys = {p: {"configured": bool(os.environ.get(_PROV_KEY_ENV[p])),
                 "base": os.environ.get(_PROV_BASE_ENV[p]) or ""} for p in _PROV_KEY_ENV}
-    return {"live": st.get("live") or {}, "default": st.get("default") or {}, "keys": keys}
+    return {"live": st.get("live") or {}, "default": st.get("default") or {}, "keys": keys,
+            "evolve_interval": st.get("evolve_interval") or None}
+
+
+def settings_set_interval(body):
+    """Manos entre propuestas del coach automático (evolve). Persiste en settings.json."""
+    try:
+        v = int(body.get("interval"))
+    except Exception:
+        return {"error": "interval inválido"}
+    if not 100 <= v <= 100000:
+        return {"error": "interval fuera de rango (100-100000)"}
+    st = _settings()
+    st["evolve_interval"] = v
+    _settings_save(st)
+    return {"ok": True, "interval": v}
 
 
 def _apply_settings_keys():
@@ -524,12 +559,38 @@ def _apply_settings_keys():
             os.environ[k] = str(v)
 
 
+# Base URLs permitidas por proveedor (anti-SSRF: la key del proveedor viaja a estas bases)
+_PROV_BASE_HOSTS = {
+    "minimax": ("api.minimax.io", "api.minimaxi.com"),
+    "openrouter": ("openrouter.ai",),
+    "xiaomi": ("api.xiaomi.com", "mimo.xiaomi.com"),
+    "deepseek": ("api.deepseek.com",),
+}
+
+
+def _base_ok(provider, base):
+    """True si la base URL es https y su host es del proveedor (o localhost para pruebas)."""
+    from urllib.parse import urlparse
+    try:
+        u = urlparse(base)
+    except Exception:
+        return False
+    if u.scheme != "https" or not u.hostname:
+        return False
+    h = u.hostname.lower()
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return True
+    return any(h == d or h.endswith("." + d) for d in _PROV_BASE_HOSTS.get(provider, ()))
+
+
 def settings_save_key(body):
     provider = str(body.get("provider", ""))
     if provider not in _PROV_KEY_ENV:
         return {"error": "proveedor desconocido"}
     key = str(body.get("key", "") or "").strip()
     base = str(body.get("base", "") or "").strip()
+    if base and not _base_ok(provider, base):
+        return {"error": "base URL no permitida para " + provider}
     st = _settings()
     keys = st.setdefault("keys", {})       # persistente en /data/settings.json (sobrevive rebuilds)
     if key:
@@ -548,6 +609,10 @@ def settings_set_model(body):
     if scope not in ("live", "default") or not mid:
         return {"error": "scope o modelo inválido"}
     prov, model = (mid.split(":", 1) if ":" in mid else ("minimax", mid))
+    if prov not in _PROV_KEY_ENV:
+        return {"error": "proveedor desconocido: " + prov}
+    if not re.fullmatch(r"[A-Za-z0-9_./:-]{1,100}", model):
+        return {"error": "modelo inválido"}
     st = _settings()
     st[scope] = {"provider": prov, "model": model, "id": mid}
     _settings_save(st)
@@ -687,9 +752,16 @@ def production_session(label=""):
             "postflop": post, "agg": agg}
 
 
-def production_account():
+_ACCT_CACHE = {"ts": 0.0, "data": None}
+
+
+def production_account(force=False):
     """Agente reclamado de la cuenta en uso (data/.arena-pg-credentials) + su posición en el
-    leaderboard de cada evento (Eval + competiciones activas). Pagina el leaderboard buscando su agentId."""
+    leaderboard de cada evento (Eval + competiciones activas). Pagina el leaderboard buscando su agentId.
+    Cache 60s: la paginación cuesta ~35 requests por llamada."""
+    now = time.time()
+    if not force and _ACCT_CACHE["data"] is not None and now - _ACCT_CACHE["ts"] < 60:
+        return _ACCT_CACHE["data"]
     import urllib.request as _u
     base = os.environ.get("ARENA_API_BASE", "https://arena.dev.fun/api/arena")
     try:
@@ -744,7 +816,70 @@ def production_account():
         events.append({"name": nm, "rank": rank, "total": total,
                        "score": (round(score, 1) if isinstance(score, (int, float)) else None),
                        "registered": rank is not None})
-    return {"agent": agent, "events": events}
+    out = {"agent": agent, "events": events}
+    _ACCT_CACHE.update(ts=time.time(), data=out)
+    return out
+
+
+def season_status():
+    """Estado de temporada: competiciones TexasHoldem vivas (list-active) + si nuestro agente
+    está registrado (en leaderboard) + si hay un deploy activo en ella. Para la UI de JUEGO."""
+    acct = production_account()
+    events = {e.get("name"): e for e in (acct.get("events") or [])} if isinstance(acct, dict) else {}
+    deploys = _jload(_DEPLOYS_PATH, {})
+    active_comps = {deploys.get(j["label"], {}).get("competition")
+                    for j in _prod_active()}
+    for _g in ("cash", "tournament"):            # PvP externo (servicio compose) → su competición viva cuenta como "jugando"
+        if _pvp_lock_held(_g):
+            try:
+                _ids, _c = _active_comps(_g)
+                if _c and _c.get("id"):
+                    active_comps.add(_c["id"])
+            except Exception:
+                pass
+    out = []
+    key = _any_key()
+    comps = []
+    if key:
+        try:
+            import sys as _s
+            _s.path.insert(0, os.path.join(HERE, "examples"))
+            from arena_client import ArenaClient, DEFAULT_BASE
+            c = ArenaClient(os.environ.get("ARENA_API_BASE", DEFAULT_BASE), api_key=key)
+            try:
+                r = c.get("/competition/list-active")
+            finally:
+                c.close()
+            comps = r if isinstance(r, list) else (r.get("competitions") or r.get("data") or [])
+        except Exception as e:
+            return {"error": "list-active: " + str(e)[:120], "seasons": []}
+    for x in comps:
+        if not isinstance(x, dict) or str(x.get("gameType")) != "TexasHoldem":
+            continue
+        nm = str(x.get("name") or x.get("id"))
+        ev = events.get(nm) or {}
+        out.append({"id": x.get("id"), "name": nm, "season": x.get("seasonNumber"),
+                    "registered": bool(ev.get("registered")), "rank": ev.get("rank"),
+                    "playing": x.get("id") in active_comps})
+    out.sort(key=lambda s: (s.get("season") or 0), reverse=True)
+    return {"seasons": out, "account": acct.get("agent") if isinstance(acct, dict) else None}
+
+
+def season_reresolve(body=None):
+    """Fuerza re-descubrimiento de la competición viva y re-ancla el estado de resume.
+    Si hay un PvP activo NO se toca (el watchdog de run_pvp ya rota solo)."""
+    for g in ("cash", "tournament"):
+        _ACTIVE_CACHE[g]["ts"] = 0.0
+    r = _jload(_RESUME_PATH, {})
+    changed = {}
+    for game, want in list(r.items()):
+        _ids, c = _active_comps(game)
+        if c and c.get("id") and (want or {}).get("competition") != c["id"]:
+            r[game] = {"agent": (want or {}).get("agent"), "competition": c["id"]}
+            changed[game] = c["name"]
+    if changed:
+        _jwrite(_RESUME_PATH, r)
+    return {"ok": True, "reanchored": changed, "seasons": season_status().get("seasons")}
 
 
 def queue_tick_once():
@@ -773,6 +908,8 @@ def resume_tick_once():
     for game, want in list(r.items()):
         agent = (want or {}).get("agent")
         if not agent or game in active_games:                 # ya hay un PvP vivo de ese game
+            continue
+        if _pvp_lock_held(game):                              # otro proceso (p.ej. servicio compose pvp) ya lo juega
             continue
         if now - _last_resume.get(game, 0) < 90:              # throttle: no relanzar el mismo game más de 1x/90s
             continue

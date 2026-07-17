@@ -72,6 +72,21 @@ def main():
                    files={"file": ("bundle.zip", fh, "application/zip")})
     log("submit:", r.status_code, r.text[:500])
     rec("submit", {"status": r.status_code, "body": r.text[:2000]})
+    if r.status_code == 409:
+        log("agente ya corriendo — espero 60s y reintento (max 60 intentos)...")
+        for i in range(60):
+            time.sleep(60)
+            with open(a.bundle, "rb") as fh2:
+                r = c.post("/submissions", data={"competitionId": comp, "template": "static-agent"},
+                           files={"file": ("bundle.zip", fh2, "application/zip")})
+            log(f"reintento {i+1}/60:", r.status_code, r.text[:200])
+            rec("retry", {"attempt": i+1, "status": r.status_code, "body": r.text[:500]})
+            if r.status_code in (200, 201, 202):
+                break
+            if r.status_code != 409:
+                break
+        else:
+            log("timeout esperando que termine la submission anterior"); sys.exit(3)
     if r.status_code not in (200, 201, 202):
         sys.exit(3)
     body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}

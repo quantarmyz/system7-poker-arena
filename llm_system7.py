@@ -7,9 +7,9 @@ Falls back to the deterministic decide_system7 engine on any failure / timeout /
 deadline<3s / missing key. Reuses the kit's L5 scaffold (examples/llm_agent.py:
 parse, validate, model-agnostic call) and the 429/409-hardened loop.
 
-    uv run llm_system7.py --max-hands 50          # live; needs ANTHROPIC_API_KEY in .env
+    uv run llm_system7.py --max-hands 50          # live; needs OPENAI_API_KEY in .env
     uv run llm_system7.py --dry-run --mock-llm    # offline mock (free)
-    S7_MODEL=claude-opus-4-8 uv run llm_system7.py ...   # stronger model
+    S7_MODEL=deepseek/deepseek-v3.2 uv run llm_system7.py ...   # otro modelo (flash recomendado)
 
 Identity comes from this dir's .arena-credentials (agent `system7`).
 """
@@ -90,6 +90,8 @@ def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
         model = model_hint or os.environ.get("S7_MODEL", "MiniMax-M3")
         resp = client.chat.completions.create(
             model=model,
+            # S7_MAX_TOKENS = presupuesto MÍNIMO garantizado (el caller puede pedir más);
+            # un cap aquí truncaría la respuesta JSON del modelo → fallback al heurístico.
             max_tokens=max(int(max_tokens or 0), int(os.environ.get("S7_MAX_TOKENS", "3000"))),
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}])
@@ -99,7 +101,10 @@ def _minimax_call(system, user, max_tokens, model_hint, mock_mod=None):
         _M3_TLS.v = {"model": model, "think": (tm.group(1).strip()[:2000] if tm else ""),
                    "answer": answer[:2000], "sent": str(user or "")[:2500], "ts": _time.time()}
         return answer
-    except Exception:
+    except Exception as e:
+        _M3_TLS.v = {"model": model, "think": "", "answer": "", "sent": str(user or "")[:2500],
+                     "ts": _time.time(), "error": str(e)[:200]}
+        print("[s7-llm] fallo LLM (%s) → fallback heurístico" % str(e)[:160], flush=True)
         return None
 
 
